@@ -56,6 +56,15 @@ if [ -n "${EXLINE:-}" ]; then
   head -n "$EXLINE" "$TRACE" | grep "^IN: " | tail -4
 fi
 echo
+echo "############ 5b. context before first fetch-fault (pc=0 null jump) ############"
+FF=$(grep -n "fault_fetch" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
+if [ -n "${FF:-}" ]; then
+  echo "(first fault_fetch at trace line $FF)"
+  head -n "$FF" "$TRACE" | grep "^IN: " | tail -16
+else
+  echo "(no fetch fault)"
+fi
+echo
 echo "############ 6. crash/panic path (last 25 IN: before first esp_restart_noos, else last 25) ############"
 N=$(grep -n "^IN: esp_restart_noos" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
 if [ -n "${N:-}" ]; then echo "(reboot at line $N)"; head -n "$N" "$TRACE" | grep "^IN: " | tail -25; else echo "(no reboot — last 25 IN:)"; grep "^IN: " "$TRACE" | tail -25; fi
