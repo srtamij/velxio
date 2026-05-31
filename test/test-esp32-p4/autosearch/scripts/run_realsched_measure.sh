@@ -56,11 +56,14 @@ if [ -n "${EXLINE:-}" ]; then
   head -n "$EXLINE" "$TRACE" | grep "^IN: " | tail -4
 fi
 echo
-echo "############ 5b. context before first fetch-fault (pc=0 null jump) ############"
-FF=$(grep -n "fault_fetch" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
+echo "############ 5b. context before first fetch-fault / illegal-instr / abort ############"
+FF=$(grep -nE "fault_fetch|illegal_instruction" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
 if [ -n "${FF:-}" ]; then
   echo "(first fault_fetch at trace line $FF)"
-  head -n "$FF" "$TRACE" | grep "^IN: " | tail -16
+  echo "--- IN: functions before fault ---"
+  head -n "$FF" "$TRACE" | grep "^IN: " | tail -12
+  echo "--- raw asm of last TB before fault (the restore) ---"
+  head -n "$FF" "$TRACE" | tail -40
 else
   echo "(no fetch fault)"
 fi
