@@ -76,7 +76,7 @@ echo "############ 6b. panic TRIGGER (IN: before first esp_panic_handler) ######
 PN=$(grep -n "IN: esp_panic_handler" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
 if [ -n "${PN:-}" ]; then
   echo "(first esp_panic_handler at line $PN)"
-  head -n "$PN" "$TRACE" | grep "^IN: " | tail -32
+  head -n "$PN" "$TRACE" | grep "^IN: " | grep -vE "vTaskSwitchContext|esp_crosscore|rtos_int|_interrupt_handler|_global_interrupt|intr_get_item|vPortYield|esp_timer_get_time" | tail -22
 else
   echo "(no panic_handler — clean run?)"
 fi
