@@ -72,6 +72,17 @@ echo "############ 6. crash/panic path (last 25 IN: before first esp_restart_noo
 N=$(grep -n "^IN: esp_restart_noos" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
 if [ -n "${N:-}" ]; then echo "(reboot at line $N)"; head -n "$N" "$TRACE" | grep "^IN: " | tail -25; else echo "(no reboot — last 25 IN:)"; grep "^IN: " "$TRACE" | tail -25; fi
 echo
+echo "############ 6b. panic TRIGGER (IN: before first esp_panic_handler) ############"
+PN=$(grep -n "IN: esp_panic_handler" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
+if [ -n "${PN:-}" ]; then
+  echo "(first esp_panic_handler at line $PN)"
+  head -n "$PN" "$TRACE" | grep "^IN: " | tail -32
+else
+  echo "(no panic_handler — clean run?)"
+fi
+echo "--- WDT/abort symbols in trace ---"
+grep -oE "^IN: (esp_task_wdt[a-zA-Z_]*|[a-z_]*wdt[a-z_]*isr|panic_abort|esp_system_abort|__assert_func|vApplicationStackOverflowHook)" "$TRACE" 2>/dev/null | sort | uniq -c
+echo
 echo "############ 7. panic/wdt/sched handler symbols ############"
 grep -oE "^IN: (esp_panic[a-z_]*|panic[a-z_]*|abort|xt_[a-z_]*|[a-z_]*exception[a-z_]*|vApplication[A-Za-z]*|prvCheckTasksWaiting[A-Za-z]*|vTaskSwitchContext|esp_restart[a-z_]*)" "$TRACE" 2>/dev/null | sort | uniq -c | sort -rn | head -20
 echo
