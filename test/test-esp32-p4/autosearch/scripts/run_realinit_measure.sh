@@ -27,6 +27,13 @@ for s in do_system_init_fn esp_psram_init esp_psram_chip_init mmu_psram_flash_in
   [ "${n:-0}" -gt 0 ] && echo "  REACHED ${s} (${n})"
 done
 echo
+echo "############ 1b. deep boot milestones (scheduler/app/setup/loop) ############"
+for s in esp_startup_start_app vTaskStartScheduler main_task app_main initArduino _Z5setupv _Z4loopv loopTask; do
+  n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)
+  if [ "${n:-0}" -gt 0 ]; then echo "  REACHED $s ($n)"; else echo "  ----    $s"; fi
+done
+echo
+
 echo "############ 2. first SYNCHRONOUS CPU exception (async:0 = real trap) ############"
 # async:0 = synchronous exception (a real fault, not a timer/IRQ which are async:1)
 grep -nE "do_interrupt: .*async:0" "$TRACE" 2>/dev/null | head -4

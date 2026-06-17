@@ -311,6 +311,31 @@ time-base decision below.
 3. **Suppress WDTs under VELXIO_REAL_INIT** — done (debug accommodation), but
    NOT sufficient for #6 (the trigger is the consolidated TIMG timer IRQ above).
 
+### Real blocker #6 (RESOLVED 🎉): demo self-test timers polluting the real flow
+The actual cause was NOT the WDT and NOT (yet) the TIMG-interrupt-separation: it
+was our **machine's own demo self-tests**. At machine_init we pre-program TIMG0
+(1 s autoreload + INT_ENA) and TIMG1 (500 ms autoreload + INT_ENA) — the Phase
+2.AG/2.AN demo timers — which fire PERIODIC IRQs. Under the real firmware flow
+those IRQs reach the genuine ISRs (e.g. `task_wdt_isr` before `esp_task_wdt_init`
+runs → NULL deref). **Fix:** gate the interrupt-arming self-tests behind
+`esp32p4_demo_mode` (= no `VELXIO_REAL_FLOW`/`VELXIO_REAL_SCHED`), so the real
+firmware programs the timers itself. Pure-demo builds keep the self-tests intact.
+
+**🎉🎉 MAJOR MILESTONE — the real boot now reaches `initArduino`.** With the demo
+timers gated, REAL_INIT runs the GENUINE path with NO scheduler bypass:
+`esp_startup_start_app → vTaskStartScheduler → main_task → app_main → initArduino`
+all execute on the real FreeRTOS scheduler (the real `do_system_init` completed:
+heap/esp_timer/newlib/mmu/flash, real ROM, faithful SYSTIMER). REAL_SCHED blink
+verified intact (GPIO2, 2/2).
+
+### Real blocker #7 (current): spin inside `initArduino`
+Stuck in a critical-section/spinlock loop in `initArduino`
+(`xPortEnterCriticalTimeout` / `esp_cpu_compare_and_set` /
+`vPortClearInterruptMaskFromISR`). Likely a spinlock waiting on the absent 2nd HP
+core, or a driver init blocking on a peripheral/queue. `setup()`/`loop()` are the
+next milestones — very close.
+**Next:** trace what `initArduino` blocks on (which spinlock/resource).
+
 ## Next steps (full-fidelity grind, in order)
 
 1. Fix blocker #6 (Task-WDT ISR firing early / NULL deref).
