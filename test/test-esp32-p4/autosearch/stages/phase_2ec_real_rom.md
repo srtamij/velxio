@@ -267,10 +267,49 @@ instrs) a 2.5 s WDT elapses mid-init. BUT an **untraced** run produces no
 peripheral activity either (doesn't reach the app), so it's not purely a trace
 artifact — there's a traced/untraced (Heisenbug-style) timing divergence to
 untangle.
-**Next:** ensure the task/INT-WDT does not fire during a normal boot (it's fed
-regularly; our model must honour the feed + the configured timeout and not raise
-the IRQ early), and/or confirm the CLIC isn't mis-routing a TIMG IRQ to
-`task_wdt_isr` before `esp_task_wdt_init` completes.
+**Root cause (real-time-model tension, NOT a register bug):** the TIMG WDT and
+RTC WDT timers use **`QEMU_CLOCK_REALTIME`** (`esp32p4_timg.c:614`,
+`esp32p4_lp_wdt.c:463`) — pure wall-clock, independent of guest progress. The
+`-d in_asm,int` traced boot is ~100x slower than real, so the WDTs armed by the
+bootloader/early init (2500 ms / 9066 ms) elapse DURING the slow traced init; the
+pending IRQ is delivered to `task_wdt_isr` the moment `esp_task_wdt_impl_timer_allocate`
+registers it via `esp_intr_alloc`, before `esp_task_wdt_init` sets `p_twdt_obj`.
+The TWDT uses the TIMG MWDT (`task_wdt_impl_timergroup.c`): `esp_intr_alloc(TWDT_INTR_SOURCE,…)`
++ `wdt_hal_config_stage(…WDT_STAGE_ACTION_INT)`; "the WDT is enabled later in
+`…_timer_restart`" — so a WDT IRQ arriving during allocate is premature.
+
+The faithful tension: a real WDT uses real time (must fire if the guest truly
+hangs), but the trace artificially slows the guest. Our SYSTIMER counter is now
+VIRTUAL_RT (needed so busy-wait delays terminate), while the WDTs are REALTIME —
+inconsistent. An **untraced** run also fails to reach the app, so there's a
+companion timing thread (long `esp_rom_delay` on the VIRTUAL_RT counter vs the
+REALTIME WDT) to untangle.
+
+**UPDATE — the real #6 trigger is interrupt-routing fidelity, not the WDT timer.**
+Suppressing the WDT timer callbacks under VELXIO_REAL_INIT (added to
+`esp32p4_timg_wdt_reset_cb` + the two `esp32p4_lp_wdt` cbs) stopped the WDT
+"fire" but `task_wdt_isr` STILL runs. The device log shows
+`[esp32p4.timg0/timg1] CPU IRQ line -> 1` from a **TIMER (T0/T1) alarm**, not the
+WDT. Root cause: our **TIMG model consolidates T0/T1/WDT into ONE CPU IRQ line**
+(`esp32p4.timg.intr`, asserted while `int_raw & int_ena`). On real P4 the TIMG
+**WDT interrupt is a SEPARATE source** from the timer interrupts;
+`esp_intr_alloc(TWDT_INTR_SOURCE)` binds `task_wdt_isr` to the WDT source, but our
+single consolidated line delivers a TIMER IRQ to it → `task_wdt_isr` fires for the
+wrong reason (with `p_twdt_obj` still NULL). (ADC/LEDC also raise IRQs in this
+window — same single-line-per-peripheral consolidation worth auditing.)
+**The real fix for #6:** give the TIMG WDT its own interrupt source/CLIC line,
+distinct from the T0/T1 timer interrupts, so the WDT ISR only runs on a real WDT
+event. Then the WDT-time tension (REALTIME vs guest time) still needs the
+time-base decision below.
+
+**Time-base options (separate, still needed):**
+1. **icount** (`-icount`): virtual time instruction-counted; systimer + WDT on
+   QEMU_CLOCK_VIRTUAL → consistent, trace-speed-independent. Most correct; biggest
+   change.
+2. **WDT on QEMU_CLOCK_VIRTUAL** instead of REALTIME — risk to the WDT demos
+   (2.BM/2.BU/2.BV) tuned to REALTIME.
+3. **Suppress WDTs under VELXIO_REAL_INIT** — done (debug accommodation), but
+   NOT sufficient for #6 (the trigger is the consolidated TIMG timer IRQ above).
 
 ## Next steps (full-fidelity grind, in order)
 

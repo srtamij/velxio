@@ -38,6 +38,9 @@ if [ -n "${EXLINE:-}" ]; then
   START=$((EXLINE - 12)); sed -n "${START},${EXLINE}p" "$TRACE"
 fi
 echo
+echo "############ 2c. last 6 ASYNC interrupts (async:1 = IRQ deliveries) ############"
+grep -aE "do_interrupt: .*async:1" "$TRACE" 2>/dev/null | tail -6
+echo
 echo "############ 3. last 15 IN: functions (where it ended) ############"
 grep "^IN: " "$TRACE" | tail -15
 echo
