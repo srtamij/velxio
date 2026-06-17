@@ -254,15 +254,23 @@ real ROM (not the stale symbolisation) revealed THREE bugs in
 `init_newlib`, `esp_mmu_map` (×63), into the **Task Watchdog** init. REAL_SCHED
 blink verified intact (GPIO2 toggles, 2/2).
 
-### Real blocker #6 (current): Task-WDT ISR NULL deref
-Sync `fault_load` (cause 5, tval 0 = NULL) @`0x40007AC2` right after
-`esp_task_wdt_impl_timer_allocate` → `wdt_hal_init` → **`task_wdt_isr`** fires and
-dereferences NULL. The task-WDT interrupt triggers during init (our TIMG/esp_timer
-WDT fires it prematurely, or the TWDT task list is still NULL) and the ISR walks a
-NULL list/pointer.
-**Next:** trace why `task_wdt_isr` fires so early (WDT timeout/IRQ wiring) and what
-NULL pointer it reads; likely the TWDT shouldn't interrupt yet, or its
-`twdt_obj`/list isn't initialised when our model raises the WDT IRQ.
+### Real blocker #6 (current): Task-WDT ISR fires before init, NULL deref
+`task_wdt_isr` (@0x40007A9E) reads `p_twdt_obj` (`*(0x4FF14A58)`) then `lw a0,0(a5)`
+→ `fault_load tval:0` because **`p_twdt_obj` is still NULL**: the WDT interrupt
+fired DURING `esp_task_wdt_init`, before that function sets `p_twdt_obj`. Device
+log shows `[esp32p4.timg0/timg1] CPU IRQ line -> 1` and `timg1.wdt armed
+(timeout=2500ms)` / `rtc_wdt armed (9066ms)` — so a TIMG WDT raised its IRQ and
+the CLIC dispatched `task_wdt_isr` prematurely.
+Hypothesis (timing): the WDT timers are armed with ms timeouts and the counter is
+now VIRTUAL_RT (wall-clock); under the slow `-d`-traced boot (~15 s real for ~57k
+instrs) a 2.5 s WDT elapses mid-init. BUT an **untraced** run produces no
+peripheral activity either (doesn't reach the app), so it's not purely a trace
+artifact — there's a traced/untraced (Heisenbug-style) timing divergence to
+untangle.
+**Next:** ensure the task/INT-WDT does not fire during a normal boot (it's fed
+regularly; our model must honour the feed + the configured timeout and not raise
+the IRQ early), and/or confirm the CLIC isn't mis-routing a TIMG IRQ to
+`task_wdt_isr` before `esp_task_wdt_init` completes.
 
 ## Next steps (full-fidelity grind, in order)
 
