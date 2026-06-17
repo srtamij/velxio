@@ -328,13 +328,35 @@ all execute on the real FreeRTOS scheduler (the real `do_system_init` completed:
 heap/esp_timer/newlib/mmu/flash, real ROM, faithful SYSTIMER). REAL_SCHED blink
 verified intact (GPIO2, 2/2).
 
-### Real blocker #7 (current): spin inside `initArduino`
-Stuck in a critical-section/spinlock loop in `initArduino`
-(`xPortEnterCriticalTimeout` / `esp_cpu_compare_and_set` /
-`vPortClearInterruptMaskFromISR`). Likely a spinlock waiting on the absent 2nd HP
-core, or a driver init blocking on a peripheral/queue. `setup()`/`loop()` are the
-next milestones — very close.
-**Next:** trace what `initArduino` blocks on (which spinlock/resource).
+### Real blocker #7 (current, CONFIRMED): the DUAL-CORE gap
+Inside `initArduino` / the IDF startup the firmware does an inter-processor call
+(`esp_ipc_call_and_wait` → `esp_crosscore_int_send(core 1)`), then spins waiting
+for HP core 1 to run `ipc_task` and signal back. **Our machine only models HP
+core 0** (`Esp32P4MachineState.soc` — "HP core 1 + LP core: TODO"). Decisive
+measurement: an UNTRACED REAL_INIT run never reaches `loop()` (0 GPIO2 toggles)
+and emits **`[esp32p4.from_cpu]` 13628 times** — core 0 hammering the crosscore
+software-interrupt register, waiting on a core 1 that never responds.
+
+The blink is built dual-core (`ARDUINO_RUNNING_CORE=1`, loopTask pinned to core 1
+— which is why the bypass-patch path had to rewrite the affinity to core 0). The
+genuine path can't be patched around; it needs the 2nd core.
+
+**This is a MAJOR architectural piece, two routes:**
+1. **Model HP core 1** — a real 2nd `EspRISCVCPU`, second CLIC, crosscore IRQ
+   wiring both ways, SMP run loop. Most faithful (P4 IS dual-core); biggest
+   change. Aligns with the "closest to a physical chip" goal.
+2. **Single-core crosscore shim** — make `esp_crosscore_int_send` / the IPC
+   complete without core 1 (run the IPC callback inline on core 0, or report the
+   IPC done). Faster to a booting blink; less faithful (a real dual-core sketch
+   that runs work ON core 1 still wouldn't).
+
+## Boot progress this phase (2.EC), in order
+`ets_rom_layout_p` (real ROM) → cache/pmu (trampoline) → RTC cal → heap/
+esp_timer/newlib → flash-clock (neutralised) → SYSTIMER (faithful) → Task-WDT /
+demo-timer pollution (gated) → **real `do_system_init` complete → vTaskStartScheduler
+→ main_task → app_main → initArduino** → **#7 dual-core IPC (current)**. The whole
+genuine FreeRTOS+Arduino startup now runs with NO scheduler bypass; the remaining
+gap to `setup()`/`loop()` is the 2nd HP core.
 
 ## Next steps (full-fidelity grind, in order)
 
