@@ -47,6 +47,22 @@ echo
 echo "############ 3c. hottest repeated PC (poll target) ############"
 grep -oE "^0x[0-9a-f]+:" "$TRACE" 2>/dev/null | sort | uniq -c | sort -rn | head -8
 echo
+echo "############ 3d. abort caller chain (non-format IN: before first abort) ############"
+AB=$(grep -n "IN: abort" "$TRACE" 2>/dev/null | head -1 | cut -d: -f1)
+if [ -n "${AB:-}" ]; then
+  echo "first 'IN: abort' at trace line $AB"
+  head -n "$AB" "$TRACE" | grep "^IN: " \
+    | grep -avE "utoa|itoa|strcat|abort|printf|memcpy|memset|strlen|strlcpy|vsnprintf|__sf|strchr|strcmp|strncpy|strcpy" \
+    | tail -16
+fi
+echo
 echo "############ 4. abort/panic + gate confirmation ############"
 grep -iE "REAL-SCHED|REAL-INIT|psram|spiram" /tmp/ri_err.txt 2>/dev/null | head -8
 echo "trace lines: $(wc -l < "$TRACE" 2>/dev/null)"
+echo
+echo "############ 5. USB-Serial/JTAG console output (panic/log message) ############"
+grep -aE "usb_serial_jtag] TX #" /tmp/ri_err.txt 2>/dev/null \
+  | grep -oE "0x[0-9A-Fa-f][0-9A-Fa-f]" \
+  | while read -r h; do printf "\\x${h#0x}"; done
+echo
+echo "--- (end console) ---"

@@ -143,12 +143,78 @@ sections`; section 2 (sync exception) must be empty (no `0x4000a214` fault).
 Working REAL_SCHED blink (no `VELXIO_REAL_INIT`) unchanged — gate is off by
 default.
 
-## Next steps
+## Continuation — full-fidelity real-ROM boot (user chose path A)
 
-1. Resolve the cache-sync poll — path (B): ret-stub `Cache_Sync_Items` /
-   `Cache_Invalidate_All` (+ siblings) at their ROM entry addresses under
-   REAL_INIT, OR path (A): fix/extend the `0x3FF10098` bit-4 override so the
-   real read returns ready.
-2. Iterate the next real-ROM blockers (PMU/clock/regi2c) the same way until the
-   real `do_system_init` reaches `soc_get_available_memory_regions` (now
-   unblocked) → real heap → real scheduler → loop() with NO per-firmware stubs.
+User picked **full fidelity** (model each real-ROM HW poll) + committed the
+milestone (parent `974e335`, submodule `90cac88`). Then, continuing:
+
+### Correction: the cache-sync poll was a RED HERRING
+A `VELXIO_DBG_CACHE` probe in the smart-stub read proved the existing override
+`{0x3FF10000,0x098,0x10,SMART_FIXED}` **IS applied** — `cache 0x098 read ->
+override 0x10`. The `Cache_Sync_Items` poll exits fine; `-d in_asm` just stops
+emitting NEW translations there, so the tail *looked* like the hang. Execution
+actually proceeded into app code.
+
+### Real blocker #2 (self-inflicted): trampoline clobbered `PMU_instance`
+The real hang was `pmu_init` (app `0x4000bb90`), which calls `PMU_instance` —
+linked at **`0x30100000`** (the app's `.tcm.text` in HP_SPM). My REAL_INIT
+trampoline relocation put the trampoline AT `0x30100000`, overwriting it. The
+workflow plan's "HP_SPM, nothing else uses it" was wrong: the app links
+`.tcm.text`(0x30100000, PMU_instance) + `.tcm.data`(0x3010000c) there.
+**Fix:** relocate the trampoline into the FREE ROM gap between `.rodata` (ends
+`0x4FC1FC18`) and `.rodata.interface` (starts `0x4FC1FFE4`) →
+`tramp 0x4FC1FD00 / mret 0x4FC1FD40` — ROM space no sketch uses. Verified:
+`pmu_init` now passes, `esp_mmu_map`(×27) + `spi_flash_init_chip_state` run.
+
+### Real blocker #3 (RESOLVED): RTC slow-clock calibration spin
+Hung in `select_rtc_slow_clk` → `while (cal_val == 0)` (clk.c): `rtc_clk_cal`
+returned 0 because the **TIMG0 RTC calibration value read 0**. Per the P4 IDF
+`rtc_time.c`, `rtc_clk_cal_internal` writes `RTC_CALI_MAX` (RTCCALICFG@0x68
+bits[30:16]) + START, polls `RTC_CALI_RDY` (0x68 bit15), reads the XTAL-cycle
+count from `RTCCALICFG1`@0x6c bits[31:7]. The old `0x080` override (smart-stub
+**and** `esp32p4_timg_read` `case 0x80: return 0x1`) forced `RTC_CALI_TIMEOUT`
+(0x80 bit0) = "calibration timed out" → cal_val=0.
+**Wrinkle:** the real TIMG device (`esp32p4_timg.c`) overlays the smart stub at
+**priority 3**, so the model must live in `esp32p4_timg_read()`, not the stub.
+**Fix (`esp32p4_timg.c`):** `case 0x68` → OR-in `RTC_CALI_RDY`, preserve MAX;
+`case 0x6c` → `RTC_CALI_VALUE = MAX*294` (RC_SLOW ~136 kHz vs 40 MHz XTAL),
+placed in bits[31:7]; `case 0x80` → return 0 (no timeout). Removed the dead
+smart-stub override/special-case. (294 is the RC_SLOW default; 32K_XTAL/RC32K
+need a CLK_SEL-aware ratio — documented follow-up.)
+**Result — a big leap:** real `do_system_init` now runs `init_heap` →
+**`heap_caps_init` (45 BBs)** → **`esp_timer_init`** → **`init_newlib`** →
+`esp_mmu_map`×27 → `spi_flash_init_chip_state`. Trace 778 → **43k+ lines**.
+`soc_get_available_memory_regions` (the original 2.EC blocker) is **passed** —
+the real heap, esp_timer, and newlib all initialise.
+
+### Real blocker #4 (current): flash-HAL clock-divider assert
+`abort()` from `get_flash_clock_divider` (app `0x4000948C`). Exact assert
+(recovered from the app ELF rodata `0x40033EEC`, tag `flash_hal`):
+
+> `E (%lu) %s: Target frequency %dMHz higher than src %dMHz.`
+
+The function reads `cfg->src_mhz` (off +52) and `cfg->target_mhz` (off +48); if
+`src < target` it logs + `abort()` (a flash divider must be ≥ 1). `src` comes
+from `spimem_flash_ll_get_source_freq_mhz()` which on P4 IDF is a **hardcoded
+`return 80`**, so the configured flash target is being read as **> 80 MHz**
+(either a 120 MHz flash config, or `cfg->target_mhz` is garbage because an
+earlier MSPI clock-tree init step we don't model didn't populate it). The
+USB-Serial/JTAG console echo (`[esp32p4.usb_serial_jtag] TX …`) produced no
+bytes — IDF's `usb_serial_jtag_write` drops output when `is_connected()` reads
+false (our device reports not-connected), so the panic banner never reaches the
+FIFO; recovered the assert statically instead.
+**This is a real-silicon flash-timing check that is meaningless under emulation**
+(we back flash as RAM via the eager MMU). **Next:** instrument the actual
+`target`/`src` values (register/PC-level), then either model the MSPI clock
+source so `src ≥ target`, or recognise the check as a no-op for emulation.
+
+## Next steps (full-fidelity grind, in order)
+
+1. Capture the blocker-#4 panic message (mux USB-Serial/JTAG TX → stderr) and
+   fix the flash-clock-divider assert.
+2. Iterate the next real-init blockers the same way until real `do_system_init`
+   completes → `vTaskStartScheduler` → loop() with NO per-firmware stubs.
+
+**Uncommitted since `974e335`:** trampoline-gap relocation (`0x4FC1FD00`),
+cache-debug removal, TIMG RTC-calibration model (`esp32p4_timg.c`), smart-stub
+override cleanup. Commit when asked.
