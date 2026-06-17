@@ -204,14 +204,69 @@ bytes — IDF's `usb_serial_jtag_write` drops output when `is_connected()` reads
 false (our device reports not-connected), so the panic banner never reaches the
 FIFO; recovered the assert statically instead.
 **This is a real-silicon flash-timing check that is meaningless under emulation**
-(we back flash as RAM via the eager MMU). **Next:** instrument the actual
-`target`/`src` values (register/PC-level), then either model the MSPI clock
-source so `src ≥ target`, or recognise the check as a no-op for emulation.
+(we back flash as RAM via the eager MMU).
+
+**Reading panic/log messages is blocked** (important infra finding): the assert
+goes through `esp_log` → the USB-Serial/JTAG driver, which gates on
+`usb_serial_jtag_is_connected()` = the **firmware static `s_usb_serial_jtag_conn_status`**
+(`usb_serial_jtag_connection_monitor.c`), false in early boot — NOT a register,
+so it can't be forced from the device model. The panic banner (`esp_rom_printf`
+path) also produced no TX bytes. So every real-init blocker must be traced at
+the disasm level (objdump the asserting fn) rather than read from a console.
+
+**Next (blocker #4):** trace where `spi_flash_hal_init`'s clock-config struct
+gets `src`(+52)/`target`(+48) — the caller populates them; `src` should be 80
+(`spimem_flash_ll_get_source_freq_mhz`). If `target` is a garbage/uninit field,
+the real fix is the upstream MSPI clock-tree init step we don't model; if it is
+a genuine >80 MHz flash config, the source clock needs modelling so `src ≥
+target`. (`get_flash_clock_divider` @0x4000948C, 3 call sites in
+`spi_flash_hal_init` @0x400095E6/626/656.)
+
+### Real blocker #4 (NEUTRALISED): flash-HAL clock-divider assert
+Confirmed src=80 is hardcoded (`spimem_flash_ll_get_source_freq_mhz` → 80) and the
+board is `flash_freq=80m`, so in a correct boot src==target==80 (no abort); the
+abort means one of cfg+48/+52 is misread from a clock-config field we don't
+populate. Since this is a real-silicon SPI-timing check meaningless under
+emulation (flash = RAM via eager MMU), neutralised the guard: REAL_INIT-gated
+patch rewrites `bge a6,a5,+0x3C` @`0x40009498` → `jal x0,+0x3C` (=0x03C0006F) so
+it always takes the normal path (computes ceil(src/target), no fault).
+**Result: boot advances** — `esp_mmu_map` 27→**63**, no sync fault; reaches the
+SYSTIMER. (Firmware-address neutraliser to map blockers; faithful fix later =
+model the clock-config source.)
+
+### Real blocker #5 (FIXED): SYSTIMER counter read — faithful device fixes
+Hung in the ROM `systimer_hal_get_counter_value` (@0x4FC05336). Disassembling the
+real ROM (not the stale symbolisation) revealed THREE bugs in
+`esp32p4_systimer.c`, all now fixed faithfully (no firmware patch):
+1. **Wrong UPDATE/VALID bit positions (the real blocker).** The ROM writes
+   `unit_op[0] |= 0x40000000` (UPDATE = **bit 30**) then polls `(reg>>29)&1`
+   (VALUE_VALID = **bit 29**) — confirmed in `soc/esp32p4/systimer_reg.h`. Our
+   model used bits 31/30 (off by one): the UPDATE write was ignored and the
+   VALID poll never read 1 → infinite spin.
+2. **Snapshot cleared on every LO read.** `systimer_hal_get_counter_value` reads
+   LO,HI,LO and loops `while (lo_start != lo)`. Clearing on LO made the next read
+   re-sample a different value → never matched. Now the snapshot is LATCHED by
+   the UPDATE write and stays stable until the next UPDATE (real-HW semantics).
+3. **Counter sourced from QEMU_CLOCK_VIRTUAL.** Plain VIRTUAL freezes in a tight
+   busy-wait (IDF delays read the counter in a CPU loop), so the counter never
+   advanced. Switched to VIRTUAL_RT (wall-clock-anchored, matches the tick).
+**Result: boot 43k → 57k lines** — past SYSTIMER through `esp_timer`,
+`init_newlib`, `esp_mmu_map` (×63), into the **Task Watchdog** init. REAL_SCHED
+blink verified intact (GPIO2 toggles, 2/2).
+
+### Real blocker #6 (current): Task-WDT ISR NULL deref
+Sync `fault_load` (cause 5, tval 0 = NULL) @`0x40007AC2` right after
+`esp_task_wdt_impl_timer_allocate` → `wdt_hal_init` → **`task_wdt_isr`** fires and
+dereferences NULL. The task-WDT interrupt triggers during init (our TIMG/esp_timer
+WDT fires it prematurely, or the TWDT task list is still NULL) and the ISR walks a
+NULL list/pointer.
+**Next:** trace why `task_wdt_isr` fires so early (WDT timeout/IRQ wiring) and what
+NULL pointer it reads; likely the TWDT shouldn't interrupt yet, or its
+`twdt_obj`/list isn't initialised when our model raises the WDT IRQ.
 
 ## Next steps (full-fidelity grind, in order)
 
-1. Capture the blocker-#4 panic message (mux USB-Serial/JTAG TX → stderr) and
-   fix the flash-clock-divider assert.
+1. Fix blocker #6 (Task-WDT ISR firing early / NULL deref).
 2. Iterate the next real-init blockers the same way until real `do_system_init`
    completes → `vTaskStartScheduler` → loop() with NO per-firmware stubs.
 
