@@ -122,6 +122,33 @@ core 0.
 - **Step 3:** core 1's own INTMTX (CORE1 matrix base) + per-core CLIC; verify
   `ipc_task` runs on core 1 and the IPC completes → `setup()`/`loop()`.
 
+### Step 2 — ✅ DONE (crosscore matrix + FROM_CPU_1 → core 1 wiring)
+
+Implemented in `esp32p4.c`:
+- **HP CPU1 Interrupt Matrix @ `0x500D6800`** (`DR_REG_INTERRUPT_CORE1_BASE` =
+  CORE0 + 0x800, TRM Ch 12.5.2): a 2nd `Esp32P4Intmtx` whose `cpu` is core 1,
+  created in `esp32p4_install_intmtx` when core 1 is present.
+- **FROM_CPU_1** (`0x500E5014`) write → raises core 1's CLIC line via core 1's
+  matrix mapping of source **80** (`ETS_FROM_CPU_INTR1`; core 0 uses source 79).
+
+**Verified (REAL_INIT trace):**
+```
+[esp32p4] HP CPU1 interrupt matrix @0x500d6800 installed
+[esp32p4.intmtx1] MAP src 80 -> intr 16 (cpu line 32)   <- core1 maps its crosscore src
+[esp32p4.from_cpu] FROM_CPU_1=1 -> core1 line 32 RAISE   <- core0's IPC reaches core1's CLIC
+```
+- **Untraced `from_cpu` writes: 147 → 19** (was 13628 pre-core-1). The IPC
+  handshake is nearly complete — the crosscore IRQ now reaches core 1.
+- **Zero regression:** REAL_SCHED blink toggles GPIO2.
+
+**Step 3 (remaining):** the boot still doesn't reach `loop()`. Core 1 receives
+the crosscore IRQ on line 32 but must actually *service* it: core 1's FreeRTOS
+scheduler has to be running (it needs its own SYSTIMER tick — `SYSTIMER_TARGET1`
+wired to core 1, like TARGET0→core 0) so `ipc_task` (pinned to core 1) is
+scheduled, runs the IPC callback, and signals core 0 back. Next: give the
+SYSTIMER a 2nd target IRQ wired to core 1's CLIC + confirm core 1 enables
+interrupts (mstatus.MIE) and traps the crosscore line.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
