@@ -27,6 +27,14 @@ for s in do_system_init_fn esp_psram_init esp_psram_chip_init mmu_psram_flash_in
   [ "${n:-0}" -gt 0 ] && echo "  REACHED ${s} (${n})"
 done
 echo
+echo "############ 1a. HP core 1 (dual-core) progress ############"
+grep -aE "core 1 instantiated|core 1 RELEASED" /tmp/ri_err.txt 2>/dev/null
+n_cs1=$(grep -acE "4ff00b66" "$TRACE" 2>/dev/null)
+echo "  core1 reached call_start_cpu1 (0x4ff00b66): ${n_cs1:-0}"
+echo "  core1 ROM-reset-path PCs (0x4fc000xx):"
+grep -aoE "^0x4fc000[0-9a-f][0-9a-f]:" "$TRACE" 2>/dev/null | sort | uniq -c | sort -rn | head -5
+echo
+
 echo "############ 1b. deep boot milestones (scheduler/app/setup/loop) ############"
 for s in esp_startup_start_app vTaskStartScheduler main_task app_main initArduino _Z5setupv _Z4loopv loopTask; do
   n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)

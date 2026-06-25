@@ -100,11 +100,21 @@ Implemented in `esp32p4.c`:
 - **Zero regression:** REAL_SCHED blink toggles GPIO2 (2/2); core 1 is REAL_INIT-
   gated so demo/REAL_SCHED stay single-core.
 
+**Better than expected — core 1 boots through the REAL ROM to its IDF entry.**
+A focused trace diagnostic (measure script §1a) shows core 1 after release runs
+the ROM app-cpu path (PCs `0x4fc00040..0x4fc000a8`, incl. the
+`ets_set_appcpu_boot_addr` area) and **reaches `call_start_cpu1` (`0x4ff00b66`)** —
+i.e. the faithful "core 1 resets to ROM, ROM reads the boot addr and jumps to
+the IDF app-cpu entry" path WORKS, exactly like silicon. Core 0 still reaches
+`initArduino` (the earlier apparent regression to `vTaskStartScheduler` was a
+2-core trace-interleave measurement fluke). Both cores progress; no regression.
+
 **What's still needed (Steps 2-3):** the boot does not yet reach `loop()` (0 GPIO2
-toggles). Core 1 is released to the ROM reset vector `0x4FC00000` but does not
-yet reach `call_start_cpu1` / run its own FreeRTOS, so core 0's
-`start_other_core` wait (`cpus_up`) isn't satisfied and the IPC callback isn't
-serviced on core 1.
+toggles). Core 1 reached `call_start_cpu1` but then needs to run its own FreeRTOS
+and service the crosscore IPC: `FROM_CPU_1` (`0x500E5014`) must raise an IRQ on
+**core 1**'s CLIC line so `ipc_task` (pinned to core 1) runs core 0's requested
+callback and signals back. Today the from_cpu device only wires FROM_CPU_0 →
+core 0.
 - **Step 2:** ensure core 1 reaches `call_start_cpu1` — either the real ROM
   app-cpu path (mhartid==1 branch) runs core 1 to the stored appcpu boot addr, or
   intercept `ets_set_appcpu_boot_addr` and jump core 1 there directly. Wire
