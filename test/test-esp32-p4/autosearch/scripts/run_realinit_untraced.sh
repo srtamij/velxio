@@ -7,7 +7,7 @@ QEMU="$HOME/qemu-p4-build/qemu-system-riscv32"
 export VELXIO_REAL_SCHED=1 VELXIO_REAL_INIT=1
 export ESP32P4_ROM_ELF=/mnt/c/Desarrollo/velxio/third-party/esp-rom-elfs/esp32p4_rev0_rom.elf
 rm -f /tmp/u2_err.txt
-timeout -s KILL 25 "$QEMU" -M esp32p4 -kernel "$BASE/blink.ino.elf" \
+timeout -s KILL 25 "$QEMU" -accel tcg,thread=single -smp 2 -M esp32p4 -kernel "$BASE/blink.ino.elf" \
   -drive file="$BASE/blink.ino.merged.bin",if=mtd,format=raw -nographic \
   >/tmp/u2_out.txt 2>/tmp/u2_err.txt
 echo "=== GPIO pin 2 (LED) transitions (loop reached if >0) ==="

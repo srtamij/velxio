@@ -11,7 +11,7 @@ export VELXIO_REAL_SCHED=1 VELXIO_REAL_INIT=1
 export ESP32P4_ROM_ELF=/mnt/c/Desarrollo/velxio/third-party/esp-rom-elfs/esp32p4_rev0_rom.elf
 rm -f "$TRACE" /tmp/ri_err.txt
 
-timeout -s KILL 15 "$QEMU" -M esp32p4 -kernel "$BASE/blink.ino.elf" \
+timeout -s KILL 15 "$QEMU" -accel tcg,thread=single -smp 2 -M esp32p4 -kernel "$BASE/blink.ino.elf" \
   -drive file="$BASE/blink.ino.merged.bin",if=mtd,format=raw -nographic \
   -d in_asm,int -D "$TRACE" >/tmp/ri_out.txt 2>/tmp/ri_err.txt
 

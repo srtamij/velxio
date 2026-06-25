@@ -1,0 +1,125 @@
+# Phase 2.ED — Model the HP core 1 (the dual-core gap, blocker #7)
+
+**Goal:** make the ESP32-P4 emulation dual-core, like the physical chip, so the
+real Arduino/IDF firmware's inter-processor calls (`esp_ipc_call_and_wait` →
+crosscore IRQ → core 1's `ipc_task`) complete and the boot reaches
+`setup()`/`loop()` on the genuine flow (no scheduler bypass).
+
+**Why:** Phase 2.EC got the real boot all the way to `initArduino`, where it spins
+on `esp_crosscore_int_send(core 1)` (13628 FROM_CPU writes in an untraced run)
+waiting for an HP core 1 our machine doesn't model. The P4 **is** a dual-core
+chip (2× HP RISC-V + 1 LP RISC-V), so the faithful fix is a real 2nd core.
+
+## What was investigated (sources: ESP-IDF = authoritative register defs; TRM)
+
+### The two HP cores (TRM Ch 1, Ch 12)
+- 2× HP RISC-V (RV32IMAFC + Zb/Zc), each with its **own CLIC** (core-local).
+- TRM **Ch 12.5.1/12.6.1 = HP CPU0 Interrupt Matrix**, **12.5.2/12.6.2 = HP CPU1
+  Interrupt Matrix** — i.e. each core has a SEPARATE interrupt matrix instance.
+  CORE0 matrix @ `DR_REG_INTERRUPT_CORE0_BASE = 0x500D6000` (what we model today);
+  CORE1 matrix is a distinct base (CPU1 register summary, Ch 12.5.2).
+- CLIC is mapped core-local at `0x20800000` (each core sees its own).
+
+### Core-1 startup mechanism (IDF `start_other_core`, cpu_start.c:274)
+For ESP32-P4 the sequence is:
+1. `ets_set_appcpu_boot_addr((uint32_t)call_start_cpu1)` — ROM fn @`0x4FC000A8`,
+   stores core 1's entry point.
+2. `HP_SYS_CLKRST_SOC_CLK_CTRL0_REG` (`0x500E6014`) bit4 `CORE1_CPU_CLK_EN` = 1
+   — ungate core 1's CPU clock.
+3. `HP_SYS_CLKRST_HP_RST_EN0_REG` (`0x500E60C0`) bit8 `RST_EN_CORE1_GLOBAL` = 0
+   — **release core 1 from reset** (this is the "go" edge).
+4. Core 0 then waits on `cpus_up` (set by core 1 once it boots).
+- (`CLKRST` base = `HPPERIPH1 0x500C0000 + 0x26000 = 0x500E6000`, which is our
+  existing `reset_clock` smart-stub region — good, the writes already land there.)
+
+### The crosscore / IPC path
+- `FROM_CPU_0` (`0x500E5010`) and `FROM_CPU_1` (`0x500E5014`) are the two crosscore
+  software-interrupt registers. `esp_crosscore_int_send(core_id)` writes
+  `FROM_CPU_<core_id>` → raises a crosscore IRQ **on that core**.
+- Today we wire FROM_CPU_0 → core 0's CLIC line (self-yield works single-core).
+  For IPC, core 0 writes FROM_CPU_1 → must raise an IRQ on **core 1**, whose
+  `ipc_task` (pinned to core 1) runs the requested callback and signals back via
+  a semaphore that core 0 is blocked on.
+- The blink is built dual-core (`ARDUINO_RUNNING_CORE=1`): `loopTask` is pinned to
+  core 1, which is why the bypass-patch path had to rewrite its affinity to 0.
+
+### QEMU CPU model (target/riscv/esp_cpu.c, esp_cpu.h)
+- `EspRISCVCPU` extends `RISCVCPU`; `hartid_base` → `env.mhartid` at realize (so
+  core 1 = `hartid_base = 1`).
+- Custom IRQ handler `esp_cpu_irq_handler` sets per-instance `irq_pending` +
+  `irq_cause`; CLIC delivery (2.S/2.DV) is **per-CPU** already. IRQ lines are the
+  per-device gpio `espressif-cpu-irq-lines` — so wiring FROM_CPU_1 to core1's
+  lines is the natural mechanism.
+- TCG round-robins all created, non-halted CPUs automatically. A 2nd CPU created
+  `halted` won't execute until released — exactly the reset-hold we need.
+
+## Design (incremental, gated on VELXIO_REAL_INIT for zero regression)
+
+The demo + REAL_SCHED paths must stay byte-identical (single-core), so the 2nd
+core is only created under `VELXIO_REAL_INIT` (the real-flow gate).
+
+- **Step 1 (foundation):** add `EspRISCVCPU soc1`, `hartid_base=1`, realize, hold
+  it **halted** at boot; intercept the `HP_RST_EN0` core-1-release write
+  (`0x500E60C0` bit8 → 0) to un-halt it. Start core 1 at the ROM reset vector
+  `0x4FC00000` so the real ROM's mhartid-based app-cpu path brings it up
+  (faithful — same as silicon). Measure: does core 1 fetch / does the IPC spin
+  stop?
+- **Step 2:** wire `FROM_CPU_1` (`0x500E5014`) → core 1's CLIC line so crosscore
+  IRQs reach core 1; give core 1 its own INTMTX instance (CORE1 matrix base).
+- **Step 3:** per-core CLIC/INTMTX correctness; verify `ipc_task` runs on core 1
+  and the IPC completes → `setup()`/`loop()` on the genuine flow.
+
+## Status
+
+### Step 1 (foundation) — ✅ DONE (core 1 instantiated + released; IPC spin broken)
+
+Implemented in `esp32p4.c`:
+- `EspRISCVCPU soc1` added to the machine, created under `VELXIO_REAL_INIT`,
+  `hartid_base=1`, `start_powered_off=true` (held in reset), resetvec
+  `0x4FC00000`.
+- `esp32p4_release_core1()` un-halts + kicks core 1; hooked in
+  `esp32p4_smart_stub_write` on the `HP_RST_EN0` (`0x500E60C0`) bit8
+  `RST_EN_CORE1_GLOBAL` clear — IDF `start_other_core`'s "go" edge.
+
+**What did NOT work first (documented):**
+1. **`tcg_register_thread: assertion (n < tcg_max_ctxs)`** — a 2nd CPU needs TCG
+   to allocate 2 vCPU contexts. `mc->max_cpus=2` alone is NOT enough:
+   `tcg_max_ctxs` derives from `ms->smp.max_cpus`, which stays 1 unless `-smp 2`
+   is passed. **Fix:** run REAL_INIT with `-accel tcg,thread=single -smp 2`.
+   Single-thread round-robin is also the *correct* choice for our model (shared
+   `irq_pending` state + non-thread-safe device callbacks would race under
+   MTTCG); round-robin is deterministic and safe. Scripts updated.
+
+**What worked (verified):**
+- `[esp32p4] HP core 1 instantiated (hartid=1), held in reset` then
+  `HP core 1 RELEASED from reset (RST_EN_CORE1_GLOBAL cleared) -> PC=0x4fc00000`.
+- **The IPC spin is broken:** untraced `from_cpu` writes dropped from **13628 →
+  147** — core 0 no longer hammers the crosscore register forever; it now does
+  normal IPC traffic and proceeds. `esp_startup_start_app` + `vTaskStartScheduler`
+  still reached.
+- **Zero regression:** REAL_SCHED blink toggles GPIO2 (2/2); core 1 is REAL_INIT-
+  gated so demo/REAL_SCHED stay single-core.
+
+**What's still needed (Steps 2-3):** the boot does not yet reach `loop()` (0 GPIO2
+toggles). Core 1 is released to the ROM reset vector `0x4FC00000` but does not
+yet reach `call_start_cpu1` / run its own FreeRTOS, so core 0's
+`start_other_core` wait (`cpus_up`) isn't satisfied and the IPC callback isn't
+serviced on core 1.
+- **Step 2:** ensure core 1 reaches `call_start_cpu1` — either the real ROM
+  app-cpu path (mhartid==1 branch) runs core 1 to the stored appcpu boot addr, or
+  intercept `ets_set_appcpu_boot_addr` and jump core 1 there directly. Wire
+  `FROM_CPU_1` (`0x500E5014`) → core 1's CLIC line for the crosscore IRQ.
+- **Step 3:** core 1's own INTMTX (CORE1 matrix base) + per-core CLIC; verify
+  `ipc_task` runs on core 1 and the IPC completes → `setup()`/`loop()`.
+
+## Risks / notes
+
+- SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
+  guarding it behind REAL_INIT protects the working single-core blink.
+- The CLIC mmio region is shared across cores in one address space; real silicon
+  is core-local. For a first cut, delivery via the per-device gpio lines is what
+  matters; full per-core mmio views (per-CPU AddressSpace) are a later fidelity
+  step if needed.
+- Core 1 booting through the real ROM is the most faithful; fallback is to set
+  core 1's PC directly to the stored appcpu boot addr if the ROM app-cpu path
+  doesn't run cleanly.
