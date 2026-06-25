@@ -141,13 +141,30 @@ Implemented in `esp32p4.c`:
   handshake is nearly complete — the crosscore IRQ now reaches core 1.
 - **Zero regression:** REAL_SCHED blink toggles GPIO2.
 
-**Step 3 (remaining):** the boot still doesn't reach `loop()`. Core 1 receives
-the crosscore IRQ on line 32 but must actually *service* it: core 1's FreeRTOS
-scheduler has to be running (it needs its own SYSTIMER tick — `SYSTIMER_TARGET1`
-wired to core 1, like TARGET0→core 0) so `ipc_task` (pinned to core 1) is
-scheduled, runs the IPC callback, and signals core 0 back. Next: give the
-SYSTIMER a 2nd target IRQ wired to core 1's CLIC + confirm core 1 enables
-interrupts (mstatus.MIE) and traps the crosscore line.
+**Step 2+ diagnostic (precise blocker found):** a focused trace count shows:
+```
+esp_crosscore_isr: 12      <- core 1 TAKES the crosscore IRQ and runs the ISR ✓
+xPortStartScheduler: 9     <- both cores start their schedulers ✓
+call_start_cpu1: 23        <- core 1 runs its IDF entry ✓
+ipc_task: 0                <- but ipc_task NEVER runs ✗  <-- THE blocker
+```
+So the crosscore IRQ delivery to core 1 works end-to-end (the ISR runs), but
+`ipc_task` (the FreeRTOS task that executes the IPC callback, pinned to core 1)
+is never dispatched. The ISR runs in interrupt context and should wake ipc_task
++ yield, but core 1's scheduler doesn't context-switch to it.
+
+**Step 3 (remaining):** core 1's scheduler needs its own **SYSTIMER tick**
+(`SYSTIMER_TARGET1` → core 1's CLIC, mirroring TARGET0→core 0) so it preempts the
+idle task and dispatches `ipc_task`. Today the systimer device raises only
+`irq_target0` (wired to core 0). Add a 2nd target IRQ → core 1's matrix
+(SYSTIMER_TARGET1 source) → core 1's CLIC. Also confirm `ipc_task` is created on
+core 1 (`esp_ipc_init`). Then ipc_task runs the callback, signals core 0, and the
+boot proceeds to `setup()`/`loop()`.
+
+### Progress summary (FROM_CPU writes, untraced, lower = closer to done)
+`13628` (no core 1) → `147` (core 1 released, step 1) → `19` (crosscore wired,
+step 2). The dual-core IPC is nearly complete; the last gap is core 1's scheduler
+tick so ipc_task runs.
 
 ## Risks / notes
 

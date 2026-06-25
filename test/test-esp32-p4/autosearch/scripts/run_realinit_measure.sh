@@ -35,6 +35,14 @@ echo "  core1 ROM-reset-path PCs (0x4fc000xx):"
 grep -aoE "^0x4fc000[0-9a-f][0-9a-f]:" "$TRACE" 2>/dev/null | sort | uniq -c | sort -rn | head -5
 echo
 
+echo "############ 1a2. core 1 IPC servicing (does core 1 take the crosscore IRQ?) ############"
+for s in esp_crosscore_isr xPortStartScheduler ipc_task call_start_cpu1 esp_ipc_call_and_wait; do
+  n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)
+  echo "  ${s}: ${n:-0}"
+done
+echo "  FROM_CPU_1 -> core1 RAISE count: $(grep -ac 'FROM_CPU_1=1 -> core1' /tmp/ri_err.txt 2>/dev/null)"
+echo
+
 echo "############ 1b. deep boot milestones (scheduler/app/setup/loop) ############"
 for s in esp_startup_start_app vTaskStartScheduler main_task app_main initArduino _Z5setupv _Z4loopv loopTask; do
   n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)
