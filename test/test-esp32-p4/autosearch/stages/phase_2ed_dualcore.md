@@ -201,6 +201,56 @@ running its idle task, spinning on a sync flag, or stuck pre-scheduler? Confirm
 cross-core start handshake (`port_xSchedulerRunning[1]`, the `xPortStartScheduler`
 core-1 path). This is the substantive remaining work to complete dual-core.
 
+## Web + source research (the dual-core boot handshake)
+
+Investigated the IDF app-cpu boot handshake (the precise mechanism core 1 must
+complete) and prior-art emulators. Sources: ESP-IDF source (authoritative),
+Espressif QEMU fork (local clone), Espressif docs, web search.
+
+### The app-cpu start handshake = shared-memory spin flags (IDF cpu_start.c / startup.c)
+This is the exact sequence that must work for core 1 to run tasks:
+1. Core 0 `start_other_core()` releases core 1 (CLKRST), then **spins**:
+   `while (!cpus_up) cpus_up &= s_cpu_up[i];` — waits for core 1.
+2. Core 1 `call_start_cpu1()`: sets `s_cpu_up[1]=true` → HW init →
+   `s_cpu_inited[1]=true` → **spins `while (!s_resume_cores)`**.
+3. Core 0 (seeing s_cpu_up) continues init, eventually sets `s_resume_cores`.
+4. Core 1 resumes → `esp_startup_start_app_other_cores()` → **spins
+   `while (!s_system_full_inited)`** → then starts its scheduler.
+5. Core 0 finishes system init → sets `s_system_full_inited`.
+6. Core 1's scheduler runs → dispatches `ipc_task` etc.
+
+**Key implication:** the whole handshake is **plain volatile globals in shared
+L2MEM** polled in tight spin loops. For it to converge under our **single-thread
+round-robin TCG**, each core must observe the other's writes across round-robin
+slices. Core 0 reaching `initArduino` proves steps 1/3/5 work (core 0 saw
+s_cpu_up, set the resume flags). So core 1 should be past its spins and into its
+scheduler — yet `ipc_task` never runs. The likely remaining issue is therefore
+**inside core 1's running scheduler** (idle runs but ipc_task isn't dispatched),
+not the boot handshake — consistent with the Step-3 finding. A core-1-filtered
+PC trace is the next diagnostic.
+
+### Prior-art emulators (reference + "are we the only P4 emulator?")
+- **Espressif QEMU fork (Xtensa ESP32) IS dual-core** — creates both CPUs upfront
+  and holds APP_CPU via Xtensa **RUNSTALL** (`xtensa_runstall`, DPORT
+  appcpu_stall/clkgate). RISC-V has no RUNSTALL; our `start_powered_off` +
+  release-on-CLKRST is the correct RISC-V equivalent (confirmed the approach).
+  The fork has **no RISC-V dual-core ESP machine** (its hw/riscv has only generic
+  boards: virt, sifive, opentitan…), so there is no P4 reference to copy.
+- **No ESP32-P4 software emulator exists anywhere** (web search June 2026): all
+  ESP32 QEMU projects (Ebiroll, mluis, emb-team, official Espressif) target the
+  Xtensa ESP32 or C3/S3. Confirms our qemu-lcgamboa P4 work is the only full-chip
+  P4 emulator — already established earlier (official Espressif QEMU has no P4).
+- **`Mister-Industries/tinyCore` (user-asked) is NOT a P4 emulator** — it's a
+  physical 50×50 mm dev board with a real **ESP32-S3** (not P4) chip; no
+  emulation/QEMU/simulation, and not even the P4 part. Unrelated to P4 software
+  emulation.
+
+### FreeRTOS-SMP fact (Espressif docs)
+Each core runs its OWN periodic tick interrupt independently (CPU0 does full tick
+duties; CPU1 only checks time-slicing + runs the app tick hook). Confirms core 1
+needs its own tick — but the Step-3 experiment showed the tick alone doesn't
+dispatch ipc_task, so the blocker is the scheduler-run state, not tick wiring.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
