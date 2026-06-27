@@ -161,10 +161,45 @@ idle task and dispatches `ipc_task`. Today the systimer device raises only
 core 1 (`esp_ipc_init`). Then ipc_task runs the callback, signals core 0, and the
 boot proceeds to `setup()`/`loop()`.
 
-### Progress summary (FROM_CPU writes, untraced, lower = closer to done)
-`13628` (no core 1) → `147` (core 1 released, step 1) → `19` (crosscore wired,
-step 2). The dual-core IPC is nearly complete; the last gap is core 1's scheduler
-tick so ipc_task runs.
+### Progress summary (FROM_CPU writes, untraced)
+`13628` (no core 1) → core-1 runs vary widely run-to-run (`19`–`244`). **The
+FROM_CPU count is NOT a reliable progress metric** — with 2 cores under
+round-robin TCG the IPC traffic is highly timing-sensitive. The stable signal is
+the deterministic milestone counts (esp_crosscore_isr runs, ipc_task does not).
+
+### Step 3 — ❌ tried, did NOT work, reverted (honest finding)
+
+Hypothesis: core 1's scheduler needs its own SYSTIMER tick to preempt idle and
+dispatch `ipc_task`. Implemented a 2nd systimer IRQ output (`irq_target1`) fired
+each tick and wired to core 1 — first as a **fixed CLIC line 17** (mirroring
+core 0), then, when that didn't work, **routed through core 1's interrupt matrix**
+(source 54 = `ETS_SYSTIMER_TARGET1`, the faithful per-core delivery).
+
+**Result: neither helped.** `ipc_task` stayed at **0** in all variants (no tick /
+fixed-line / matrix-routed). The fixed line (17) doesn't match core 1's
+firmware-assigned line (core 0 maps `SYSTIMER_TARGET0`→line 16 via its matrix, not
+17 — so the systimer's hardcoded line-17 wiring is itself questionable for the
+real flow). The matrix-routed variant delivers to the right line but core 1 still
+doesn't run ipc_task. **Reverted** the Step 3 systimer changes to keep the tree at
+the clean Step-2 state (the 2nd-IRQ infra was correct but ineffective, and added
+noise).
+
+**Why it didn't work — the real blocker is deeper than the tick.**
+`esp_crosscore_isr` runs on core 1 (interrupt delivery works), and the crosscore
+ISR's ISR-context `portYIELD_FROM_ISR` should dispatch `ipc_task` *without needing
+a periodic tick* if the scheduler is running tasks. `ipc_task: 0` means core 1's
+FreeRTOS scheduler isn't dispatching tasks at all — likely core 1 is stuck before
+running its idle/first task (a FreeRTOS-SMP sync point: `xPortStartScheduler` on
+core 1 waits on a cross-core flag / spinlock that our round-robin model doesn't
+satisfy), OR `ipc_task` isn't created for core 1. This is genuine dual-core
+FreeRTOS-SMP territory, not an interrupt-wiring gap.
+
+**Next (deeper diagnosis required):** trace core 1 specifically (filter by PC
+ranges / mhartid) to find where core 1 sits after `call_start_cpu1` — is it
+running its idle task, spinning on a sync flag, or stuck pre-scheduler? Confirm
+`ipc_task` is created for core 1 (`esp_ipc_init`). Check the FreeRTOS-SMP
+cross-core start handshake (`port_xSchedulerRunning[1]`, the `xPortStartScheduler`
+core-1 path). This is the substantive remaining work to complete dual-core.
 
 ## Risks / notes
 
