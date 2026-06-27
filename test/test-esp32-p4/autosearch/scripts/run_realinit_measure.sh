@@ -54,6 +54,23 @@ for s in __libc_init_array do_global_ctors xTaskCreatePinnedToCore vPortSetupTim
 done
 echo
 
+echo "############ 1a4. C++ constructor loop PC-watch (do_global_ctors in start_cpu0) ############"
+echo "  start_cpu0 entry      0x400091e8: $(grep -ac '^0x400091e8:' "$TRACE" 2>/dev/null)"
+echo "  do_system_init(0) call 0x400091f2: $(grep -ac '^0x400091f2:' "$TRACE" 2>/dev/null)"
+echo "  ctor-loop body        0x4000925c: $(grep -ac '^0x4000925c:' "$TRACE" 2>/dev/null)"
+echo "  ctor CALL (jalr a5)   0x40009260: $(grep -ac '^0x40009260:' "$TRACE" 2>/dev/null)"
+echo "  ctor-loop2 CALL       0x40009266: $(grep -ac '^0x40009266:' "$TRACE" 2>/dev/null)"
+echo "  esp_startup_start_app 0x40009256: $(grep -ac '^0x40009256:' "$TRACE" 2>/dev/null)"
+echo "  __register_frame_info 0x4001e5a8: $(grep -ac '^0x4001e5a8:' "$TRACE" 2>/dev/null)"
+echo "  after reg_frame ret   0x4000920e: $(grep -ac '^0x4000920e:' "$TRACE" 2>/dev/null)"
+echo "  bgeu (ctor range chk) 0x40009230: $(grep -ac '^0x40009230:' "$TRACE" 2>/dev/null)"
+echo "  resume_other_cores    0x40009234: $(grep -ac '^0x40009234:' "$TRACE" 2>/dev/null)"
+echo "  --- did specific ctors run? ---"
+echo "  esp_ipc_init          0x40007010: $(grep -ac '^0x40007010:' "$TRACE" 2>/dev/null)"
+echo "  HardwareSerial ctor   0x400006b4: $(grep -ac '^0x400006b4:' "$TRACE" 2>/dev/null)"
+echo "  String ctor           0x40000b44: $(grep -ac '^0x40000b44:' "$TRACE" 2>/dev/null)"
+echo
+
 echo "############ 1b. deep boot milestones (scheduler/app/setup/loop) ############"
 for s in esp_startup_start_app vTaskStartScheduler main_task app_main initArduino _Z5setupv _Z4loopv loopTask; do
   n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)

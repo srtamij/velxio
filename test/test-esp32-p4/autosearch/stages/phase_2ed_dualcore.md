@@ -339,6 +339,86 @@ If not, find where `start_cpu0_default`'s constructor loop diverges (its bounds
 read of `__init_array_start/end`, or an early return). Fixing it unblocks both
 the IPC and Serial — a much higher-value target than the dual-core tick.
 
+### ✅ PC-watch DONE — the ctor loop's branch falls through (root cause narrowed)
+
+Disassembled `start_cpu0_default` (`0x400091E8`): `do_global_ctors` is **inlined**
+as two `__init_array` loops. The descending loop's guard is
+`bgeu s0,a5,0x40009264` @`0x40009230` (s0 = `__init_array_end-4` = `0x4003DF4C`,
+a5 = `__init_array_start` = `0x4003DF30`), with the loop body
+(`lw a5,0(s0); jalr a5`) at `0x40009264`. PC-watch counts (`-d in_asm`, raw PCs):
+```
+0x400091e8 start_cpu0 entry          : 1
+0x400091f2 do_system_init(0) call     : 1
+0x4000920e after __register_frame_info: 1
+0x40009230 bgeu (ctor-range check)    : 1   <- the guard RAN
+0x40009234 resume_other_cores         : 1   <- ...and FELL THROUGH (ctors skipped)
+0x40009264 ctor-loop body / 0x40009260 ctor CALL : 0   <- ctor loop NEVER runs
+0x40009256 esp_startup_start_app      : 1
+0x40007010 esp_ipc_init / 0x400006b4 HardwareSerial ctor : 0
+```
+**The `bgeu` at `0x40009230` should be TAKEN** (`0x4003DF4C >= 0x4003DF30`,
+deterministic register-immediate math) but it FALLS THROUGH — so either the
+instruction bytes at `0x40009230` (or the s0/a5 setup at `0x40009212..0x4000922C`)
+in the cache window **differ from the ELF**, or s0/a5 are corrupted at runtime.
+No runtime patch touches `0x40009212..0x40009262` (the only nearby patch is the
+`0x40009256` scheduler-bypass, which REAL_SCHED un-skips — confirmed by
+`esp_startup_start_app:1`).
+
+**Mechanism hypothesis:** the `.flash.text` code at `0x40009xxx` in the flash
+cache window doesn't match the ELF — an ELF-load vs flash-blob-load order / cache-
+MMU mapping conflict in the `.flash.text` band. (`.flash.rodata` @`0x4003AD24`
+`soc_memory_regions` reads CORRECTLY — so .rodata is fine but .text around the
+ctor loop may not be; different flash sections / offsets.)
+
+**Decisive next step:** read back the bytes at `0x40009212..0x40009262`
+(ctor-loop code) and `0x4003DF30..0x4003DF50` (init_array pointers) from emulator
+memory at machine-init-end (a one-shot `address_space_read` log, REAL_INIT-gated)
+and diff against the ELF disassembly/objdump. If the .text bytes are wrong, fix
+the load order / cache-window mapping so `.flash.text` matches the ELF; that
+restores the ctor loop → constructors run → ipc_task created + Serial constructed
+→ unblocks BOTH the dual-core IPC and Serial in one fix.
+
+### ✅✅ ROOT CAUSE FOUND + FIXED — demo NOPs were disabling the C++ ctor loop
+
+The machine-init read-back nailed it:
+```
+*(0x40009230)=0x00000013  (expected 0x02f47a63 bgeu)   <- the ctor-loop branch is a NOP!
+*(0x40009222)=0xf5040413  (correct)
+*(0x4003df30)=0x400006b4  (correct — init_array data is fine)
+```
+The `bgeu` guarding the `__init_array` ctor loop was **patched to a NOP**. Found
+the culprit: two **Phase 2.K demo runtime patches** that deliberately skip the C++
+constructors (the demo blob didn't need them):
+```c
+{ "start_cpu0: skip __register_frame_info",   0x4000920A, 0x00000013, 4 },
+{ "start_cpu0: skip init_array C++ ctor loop", 0x40009230, 0x00000013, 4 },
+```
+These were applied **even under REAL_INIT** — only the `do_system_init` NOPs
+(`0x400091F2`/`0x4000923A`) had been added to the REAL_INIT un-skip list, not
+these two. **Fix:** add `0x4000920A` and `0x40009230` to the REAL_INIT un-skip
+condition so the real instructions stay and `do_global_ctors` runs the
+`__init_array`.
+
+**Verified after the fix:**
+```
+*(0x40009230)=0x02f47a63  (real bgeu restored)
+esp_ipc_init        @0x40007010 : 1   <- the IPC-task constructor NOW RUNS -> ipc_task created
+HardwareSerial ctor @0x400006b4 : 1   <- Serial objects NOW CONSTRUCTED
+String ctor         @0x40000b44 : 1
+```
+**This is the unifying fix** — the C++ global constructors now execute, creating
+`ipc_task` (the dual-core IPC dependency) AND constructing the `HardwareSerial`
+`Serial` objects (the Serial-output dependency). REAL_SCHED blink unaffected
+(GPIO2 toggles). The boot now advances past the constructor phase to
+`spi_flash_disable_interrupts_caches_and_other_cpu` (a dual-core flash op that
+stalls core 1 via the now-working IPC) — a new, deeper blocker, but the
+constructor root cause is closed.
+
+**Next blocker:** `spi_flash_disable_interrupts_caches_and_other_cpu` +
+`esp_crosscore_isr` — the IPC is now exercised (ipc_task exists); core 1 must
+acknowledge the stall. This is the genuine dual-core-coordination work the earlier
+steps prepared for, now reachable because the constructors run.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
