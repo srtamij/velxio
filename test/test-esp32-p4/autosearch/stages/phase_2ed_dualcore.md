@@ -462,6 +462,55 @@ created + `HardwareSerial Serial` constructed. The dual-core boot now advances
 through the full start handshake to core 1's `xPortStartScheduler`; the last gap
 is core 1's first-task context restore (a 2.DX-class fix on the app cpu).
 
+### ✅ Per-core logging built + PRECISE root cause located (core 1 aborts)
+
+Added two reusable diagnostics to `esp_cpu.c` / `esp32p4.c` (gated by
+`VELXIO_CORELOG`): a **per-core interrupt log** (`[corelog] hart=N IRQ cause=..
+mepc=.. -> pc=..`) and a **per-core PC sampler** (`[pcsample] core0 pc=.. core1
+pc=..`). These overcome the `-d in_asm` "translation-not-execution" blind spot.
+
+**What they showed:**
+- Core 1 takes exactly ONE interrupt: `hart=1 IRQ cause=32 mepc=0x4ff00f36 ->
+  pc=0x4ff00268`. cause=32 = the FROM_CPU_1 crosscore line (Step 2); mepc is
+  inside `esp_crosscore_int_send` (core 1 sending its own yield from vPortYield);
+  pc=`0x4ff00268` = `_interrupt_handler`. So the yield IRQ IS delivered to core 1.
+- PC sampler (stable): **core0 pc=`0x4ff00268`** (`_interrupt_handler`), **core1
+  pc=`0x4ff058b6`** = `esp_restart_noos+0xf6` (`jal esp_cpu_reset; j .`) — **core 1
+  is REBOOTING.**
+- UART0 stdout (the panic handler): **`abort() was called at PC 0x400283eb on
+  core 1`** + "Core 1 register dump" + "Rebooting...".
+
+**PRECISE root cause** — disasm of `esp_startup_start_app_other_cores`
+(`0x400283bc`):
+```
+400283e2: jal xPortStartScheduler   ; must never return
+400283e6: jal abort                 ; <-- core 1 lands here (PC 0x400283eb)
+```
+**Core 1's `xPortStartScheduler` RETURNS** → falls through to `abort()` → panic →
+`esp_restart_noos` → reboot loop. `xPortStartScheduler` ends in `vPortYield()`,
+which fires the yield IRQ and spin-waits for `_interrupt_handler` to switch to the
+first task and **never return**. On core 1 the handler is entered (cause=32) but
+**returns without context-switching** → `vPortYield` returns → `xPortStartScheduler`
+returns → `abort`. So core 1's **first-task context switch via the yield ISR does
+not fire** (`_interrupt_handler` → `rtos_int_exit` → `vTaskSwitchContext` doesn't
+swap to ipc_task/idle on core 1's first yield). This is the genuine 2.DX-class
+first-task launch, now precisely on core 1.
+
+### 🎉 SIDE WIN — Serial output now works
+The panic register-dump + "Rebooting..." text came out of **UART0 (Serial)** — so
+the constructor fix (which constructs the `HardwareSerial` objects) **fixed Serial
+output**, confirmed end-to-end. One of the original Phase-2.EC goals (Serial in
+the real boot) is now met as a direct consequence of the ctor fix.
+
+### Next step (core 1 first-task switch)
+Diagnose why `_interrupt_handler` → `rtos_int_exit` doesn't switch context on
+core 1's first yield: check `pxCurrentTCBs[1]` is set, that `esp_crosscore_isr`
+runs for cause=32 on core 1 and sets the per-core yield flag, and that
+`rtos_int_exit` acts on it for core 1. Candidate complication: the REAL_SCHED
+bypass patches (heap_caps→bump, loopTask affinity 1→0, vTaskPlaceOnEventList
+NULL-guard) were tuned for the single-core blink and may interfere with the real
+dual-core scheduler — consider whether REAL_INIT should also un-skip some of them.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
