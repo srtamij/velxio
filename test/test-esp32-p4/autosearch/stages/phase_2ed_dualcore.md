@@ -419,6 +419,49 @@ constructor root cause is closed.
 acknowledge the stall. This is the genuine dual-core-coordination work the earlier
 steps prepared for, now reachable because the constructors run.
 
+### Dual-core flash-op blocker — chain verified, narrowed to core-1 first-task dispatch
+
+`spi_flash_disable_interrupts_caches_and_other_cpu` (cache_utils.c): with the
+scheduler running (initArduino time), it `esp_ipc_call_nonblocking(core1,
+spi_flash_op_block_func)` → core 1's `ipc_task` must run that to stall core 1.
+So it needs core 1's scheduler to actually dispatch `ipc_task`.
+
+Verified the whole chain with PC-watches + a machine-init read-back:
+- **`ipc_task` IS created** now (constructor fix) — but `ipc_task`/`prvIdleTask`
+  still never execute (count 0 = TB never translated = never run by either core).
+- **Core 1 passes the start handshake:** `startup_resume_other_cores` (core 0)
+  runs → core 1 exits its `while(!s_resume_cores)` spin (call_start_cpu1 @0x4ff00c04)
+  → reaches `esp_startup_start_app_other_cores` (0x400283bc) → reaches
+  `xPortStartScheduler` (0x4ff06d2c). So core 1 DOES start its scheduler.
+- **mhartid is correct** (machine-init read-back: `core0=0 core1=1`) — so
+  `xPortGetCoreID()` returns 1 on core 1 and `vPortYield` →
+  `esp_crosscore_int_send_yield(coreID=1)` → `FROM_CPU_1` → core 1's CLIC (Step 2
+  wiring) → `esp_crosscore_isr` (runs 12×). The yield is routed to the right core.
+- `vPortYield` (default FreeRTOS-Kernel, NOT the buggy hardcoded-`core_id=0`
+  FreeRTOS-Kernel-SMP variant) is correct.
+
+**So the precise remaining blocker:** core 1 reaches `xPortStartScheduler` →
+`vPortYield` (fires FROM_CPU_1, ISR runs), but its **first task (`ipc_task`/idle)
+is never dispatched** — the crosscore-yield → `vTaskSwitchContext` → first-task
+context-RESTORE on core 1 doesn't complete. This is the **same class as Phase
+2.DX** (the PC=0 / task-stack-frame context-restore that core 0 needed), now on
+core 1's first context switch.
+
+**Measurement limitation (important):** `-d in_asm` counts TB *translations*, not
+executions, and can't distinguish core 0 vs core 1 for shared TBs (a TB core 0
+already translated then run by core 1 shows count 1). To diagnose core 1's
+context switch precisely, the next step needs **per-core execution logging** —
+instrument `esp_cpu` to log `(hartid, PC)` (throttled, env-gated) so we can watch
+core 1's crosscore-yield ISR → `vTaskSwitchContext` → why the first task's context
+isn't restored. That is the concrete next step to finish dual-core.
+
+### Session headline
+The unifying constructor fix (un-skip the demo NOPs at `0x4000920A`/`0x40009230`
+under REAL_INIT) is the major win: C++ global constructors now run → `ipc_task`
+created + `HardwareSerial Serial` constructed. The dual-core boot now advances
+through the full start handshake to core 1's `xPortStartScheduler`; the last gap
+is core 1's first-task context restore (a 2.DX-class fix on the app cpu).
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;

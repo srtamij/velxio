@@ -54,6 +54,13 @@ for s in __libc_init_array do_global_ctors xTaskCreatePinnedToCore vPortSetupTim
 done
 echo
 
+echo "############ 1a5. core 1 start handshake (s_resume_cores wait) ############"
+echo "  core1 s_resume_cores wait  0x4ff00c04: $(grep -ac '^0x4ff00c04:' "$TRACE" 2>/dev/null)"
+echo "  core0 startup_resume_other 0x400080de: $(grep -ac '^0x400080de:' "$TRACE" 2>/dev/null)"
+echo "  core1 PAST wait (start_app_other_cores) 0x400283bc: $(grep -ac '^0x400283bc:' "$TRACE" 2>/dev/null)"
+echo "  core1 xPortStartScheduler  0x4ff06d2c: $(grep -ac '^0x4ff06d2c:' "$TRACE" 2>/dev/null)"
+echo
+
 echo "############ 1a4. C++ constructor loop PC-watch (do_global_ctors in start_cpu0) ############"
 echo "  start_cpu0 entry      0x400091e8: $(grep -ac '^0x400091e8:' "$TRACE" 2>/dev/null)"
 echo "  do_system_init(0) call 0x400091f2: $(grep -ac '^0x400091f2:' "$TRACE" 2>/dev/null)"
