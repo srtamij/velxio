@@ -251,6 +251,94 @@ duties; CPU1 only checks time-slicing + runs the app tick hook). Confirms core 1
 needs its own tick — but the Step-3 experiment showed the tick alone doesn't
 dispatch ipc_task, so the blocker is the scheduler-run state, not tick wiring.
 
+## Core-1 scheduler trace (the diagnostic the user asked for) — KEY REFRAMING
+
+Traced the per-function execution (`-d in_asm` `IN:` counts; 0 = never executed).
+Findings reframe the blocker as UPSTREAM of the dual-core machinery:
+
+| symbol | count | meaning |
+|---|---|---|
+| `esp_crosscore_isr` | 11 | core 1 takes the crosscore IRQ ✓ |
+| `xTaskCreatePinnedToCore` | 10 | FreeRTOS task creation works ✓ |
+| `vTaskSwitchContext` | 24 | context switches happen (core 0 init tasks) ✓ |
+| `vPortSetupTimer` | **1** | only ONCE = core 0; **core 1 never runs its scheduler body** |
+| `prvIdleTask` | **0** | **no core ever runs the idle task** |
+| `esp_ipc_init` | **0** | **ipc_task is NEVER created** |
+| `do_global_ctors` | **0** | **C++ global constructors never run** |
+| `__libc_init_array` | **0** | (same) |
+
+**Root reframing:** `esp_ipc_init` is a C++ `__attribute__((constructor))`
+(`esp_ipc.c:110`) that creates `ipc_task` pinned to each core at MAX priority. It
+is invoked by `do_global_ctors()` (`startup.c:201`, "Execute constructors",
+iterating `__init_array_start..__init_array_end`). **Both show 0 executions** — so
+the C++ constructor phase never runs in our REAL_INIT boot, therefore `ipc_task`
+is never created, therefore the crosscore IPC can never complete **regardless of
+core 1's scheduler or tick**. The dual-core wiring (Steps 1-2) is correct and
+needed, but it was chasing a symptom; the real gap is **the global-constructor
+phase not running**.
+
+**Open contradiction to resolve next:** core 0 reaches `initArduino` (which is
+*after* `do_global_ctors` in the startup order: `start_cpu0` → `do_global_ctors`
+(201) → `start_app` → `main_task` → `app_main` → `initArduino`). If
+`do_global_ctors` truly never ran, how is `initArduino` reached? Two hypotheses:
+(a) the `-d in_asm` counts are misleading for very-early one-shot functions whose
+TBs were translated before symbolised capture / flushed — need a PC-watch on
+`__init_array` addresses to confirm; (b) the REAL_INIT flow genuinely skips/faults
+`do_global_ctors` and limps on (Arduino C++ static ctors also skipped) — which
+would be a real boot-fidelity gap affecting more than IPC.
+
+**Concrete next step:** set a one-shot log when the guest executes the
+`do_global_ctors` / `__init_array` address range (read from the ELF) to settle
+(a) vs (b). If constructors genuinely don't run, fixing that (not the dual-core
+tick) is what unblocks ipc_task — and likely several other latent issues. This is
+the cleanest lead and supersedes the SYSTIMER-tick direction.
+
+### 🔑 UNIFYING FINDING — the C++ global constructors don't run (one root, two symptoms)
+
+The `.flash.init_array` (`0x4003DF30`, 8 entries, dumped from the blink ELF) holds
+**valid** constructor pointers:
+```
+0x400006b4  _GLOBAL__sub_I_hardware_serial_end   <- constructs HardwareSerial Serial0/1/2
+0x40000b44  _GLOBAL__sub_I__ZN6StringC2EPKc      <- Arduino String
+0x40003ba8  _GLOBAL__sub_I__Zli4_kHzy
+0x40007010  esp_ipc_init                          <- creates ipc_task (the IPC blocker)
+0x40028180  ...
+0x4ff03f12  ...
+0x4001b768  _GLOBAL__sub_I__ZN9__gnu_cxx9__freeresEv
+0x4001ba7e  _GLOBAL__sub_I__ZN17__eh_globals_init...
+```
+So the ELF's constructor table is correct. The trace shows `esp_ipc_init: 0` +
+`do_global_ctors: 0` → **these constructors never execute**, which explains TWO
+previously-separate symptoms with ONE root cause:
+1. **`ipc_task` is never created** → the dual-core crosscore IPC can't complete →
+   boot stalls before `setup()`/`loop()` (Phase 2.ED).
+2. **`Serial` produces no output** → `HardwareSerial`'s global constructor
+   (`_GLOBAL__sub_I_hardware_serial_end`, also in init_array) never runs, so the
+   `Serial` objects are never constructed (Phase 2.EC periph-probe symptom).
+
+**This reframes the remaining work:** the highest-value fix is NOT the dual-core
+SYSTIMER tick but **getting `do_global_ctors` / the `__init_array` constructor
+loop to actually run** in the REAL_INIT boot. That single fix would unblock the
+IPC (ipc_task) AND Serial AND any other constructor-dependent init.
+
+**Caveat / contradiction to resolve:** `soc_memory_regions` @`0x4003AD24` (same
+`0x4003xxxx` flash-cache band) read CORRECTLY in Phase 2.EC (heap init worked), so
+that band's content is generally right — arguing the init_array bytes at
+`0x4003DF30` are probably also correct in memory, and the real issue is that
+`do_global_ctors` isn't *reached/executed* (it's `static`, likely inlined into
+`start_cpu0_default` @`0x400091E8`, so it wouldn't show as its own `IN:` symbol —
+need a PC-watch on the `__init_array` iteration, not the symbol). The do_system_init
+NOPs un-skipped under REAL_INIT are at `0x400091F2`/`0x4000923A`
+(= `start_cpu0_default+0x0A`...), so the constructor loop's execution within that
+function is exactly what to verify next.
+
+**Next-step plan (supersedes SYSTIMER tick):** instrument the machine to log when
+the guest fetches from the constructor addresses (e.g. `0x40007010` esp_ipc_init,
+`0x400006b4` HardwareSerial ctor) — confirm whether `do_global_ctors` calls them.
+If not, find where `start_cpu0_default`'s constructor loop diverges (its bounds
+read of `__init_array_start/end`, or an early return). Fixing it unblocks both
+the IPC and Serial — a much higher-value target than the dual-core tick.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;

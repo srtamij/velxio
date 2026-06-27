@@ -42,6 +42,17 @@ for s in esp_crosscore_isr xPortStartScheduler ipc_task call_start_cpu1 esp_ipc_
 done
 echo "  FROM_CPU_1 -> core1 RAISE count: $(grep -ac 'FROM_CPU_1=1 -> core1' /tmp/ri_err.txt 2>/dev/null)"
 echo
+echo "############ 1a3. core 1 scheduler state (idle? ipc_task created?) ############"
+for s in prvIdleTask esp_ipc_init vPortYield vTaskSwitchContext prvCheckTasksWaitingTermination; do
+  n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)
+  echo "  ${s}: ${n:-0}"
+done
+echo "  (prvIdleTask>0 = a scheduler dispatches idle; esp_ipc_init>0 = ipc_task created)"
+for s in __libc_init_array do_global_ctors xTaskCreatePinnedToCore vPortSetupTimer vPortStartFirstTask; do
+  n=$(grep -cE "^IN: ${s}" "$TRACE" 2>/dev/null)
+  echo "  ${s}: ${n:-0}"
+done
+echo
 
 echo "############ 1b. deep boot milestones (scheduler/app/setup/loop) ############"
 for s in esp_startup_start_app vTaskStartScheduler main_task app_main initArduino _Z5setupv _Z4loopv loopTask; do
