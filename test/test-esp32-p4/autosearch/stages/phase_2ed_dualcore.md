@@ -560,6 +560,60 @@ dispatches `esp_crosscore_isr` on the right core's handler table.
 mode; common causes are the first-task context switch not completing / stack
 corruption on the secondary core — consistent with the above.
 
+### ⚡ Attacked the yield-ISR delivery — it's a TIMING RACE (yield storm), not a wiring bug
+
+Added a yield-ISR-chain counter (measure §1a6) + per-core IRQ cause distribution.
+Findings:
+- **Traced run:** the full chain runs — `_global_interrupt_handler:5`,
+  `esp_crosscore_isr:11`, **`vPortYieldFromISR:2`**, `vTaskSwitchContext:29`,
+  `rtos_int_exit:33`. So the mechanism is wired correctly and DOES fire when traced.
+- **Untraced run (real timing):** per-core IRQ log shows **core 0 takes 105×
+  `cause=33`** (its own FROM_CPU_0 crosscore-yield line, `mepc=0x4ff00f26` =
+  `esp_crosscore_int_send` epilogue) + 5× `cause=17` (tick); **core 1 takes 1×
+  `cause=32`** then hangs. So **core 0 is in a YIELD STORM** — it sends a yield,
+  takes the IRQ into `_interrupt_handler`, the context switch does NOT complete,
+  it returns, sends another yield → repeat. `schedrun=0` confirms
+  `vPortYieldFromISR` never finishes the switch untraced.
+
+**Conclusion — this is a timing-sensitive dual-core race, not a missing wire:**
+- The yield→switch chain works **traced** and works in the **single-core
+  REAL_SCHED blink** (GPIO2 toggles). It only storms/hangs **untraced + dual-core**.
+- So **adding core 1 breaks core 0's previously-working scheduler start** through
+  timing interaction (round-robin between the two cores + the immediate
+  self-yield IRQ firing the instant FROM_CPU_0 is written). The REAL_SCHED bypass
+  patches were tuned for single-core timing and don't hold under the dual-core
+  round-robin.
+
+**What this means for the fix (honest):** completing genuine dual-core is NOT a
+small patch — it requires making the real scheduler robust under dual-core
+round-robin timing. Concrete candidate directions for next session:
+1. **Edge- vs level-trigger** of the FROM_CPU crosscore line: if the self-yield
+   IRQ re-fires the instant it's written (before the ISR clears it / before the
+   switch), it can storm. Verify our from_cpu device lowers the line exactly when
+   the guest clears the FROM_CPU reg, and that the ISR's clear is ordered before
+   the switch.
+2. **rtos_int_enter/exit schedrun gating** (portasm.S:493 / :624): both early-exit
+   when `port_xSchedulerRunning[coreID]==0`; the first yield must bootstrap
+   `vPortYieldFromISR`→schedrun=1 within one ISR. Check the bootstrap ordering
+   holds under our trap timing.
+3. **TCG round-robin quantum**: a longer/shorter `-accel tcg,thread=single`
+   round-robin slice (or `-icount`) may change whether the race manifests — worth
+   an experiment to confirm it's purely timing.
+
+This is the real prerequisite the REAL_SCHED bypasses have masked since 2.DV;
+landing it is a substantial, open-ended phase of its own.
+
+**Candidate #1 (FROM_CPU clear) — RULED OUT.** Checked
+`hal/esp32p4/crosscore_int_ll.h`: trigger = `WRITE_PERI_REG(FROM_CPU_n, bit)`,
+clear = `WRITE_PERI_REG(FROM_CPU_n, 0)`, get_state = `REG_READ(FROM_CPU_n)`. Our
+`esp32p4_from_cpu` device matches exactly (write bit→raise line, write 0→lower
+line, read→stored value). So the storm is NOT a missing/!modelled clear — the
+crosscore line lowers correctly when the ISR clears it. The storm is the
+*symptom* of the context switch not completing (the timing race), not a wiring
+gap. Remaining concrete leads for next session: #2 (rtos_int_enter/exit schedrun
+bootstrap ordering) and #3 (TCG round-robin quantum / -icount experiment to
+confirm it's purely timing).
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;

@@ -54,6 +54,14 @@ for s in __libc_init_array do_global_ctors xTaskCreatePinnedToCore vPortSetupTim
 done
 echo
 
+echo "############ 1a6. yield-ISR chain (rtos_int_enter -> crosscore_isr -> vPortYieldFromISR -> switch) ############"
+for s in _global_interrupt_handler rtos_int_enter esp_crosscore_isr vPortYieldFromISR vTaskSwitchContext rtos_int_exit; do
+  n=$(grep -cE "^IN: ${s}\$" "$TRACE" 2>/dev/null)
+  echo "  ${s}: ${n:-0}"
+done
+echo "  (vPortYieldFromISR=0 -> the yield reason never sets the switch flag)"
+echo
+
 echo "############ 1a5. core 1 start handshake (s_resume_cores wait) ############"
 echo "  core1 s_resume_cores wait  0x4ff00c04: $(grep -ac '^0x4ff00c04:' "$TRACE" 2>/dev/null)"
 echo "  core0 startup_resume_other 0x400080de: $(grep -ac '^0x400080de:' "$TRACE" 2>/dev/null)"
