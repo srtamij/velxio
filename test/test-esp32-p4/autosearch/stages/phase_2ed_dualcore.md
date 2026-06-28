@@ -511,6 +511,55 @@ bypass patches (heap_caps→bump, loopTask affinity 1→0, vTaskPlaceOnEventList
 NULL-guard) were tuned for the single-core blink and may interfere with the real
 dual-core scheduler — consider whether REAL_INIT should also un-skip some of them.
 
+### 🔑🔑 DEEPEST ROOT CAUSE — the crosscore-yield context switch never completes (either core)
+
+The PC sampler was extended to dump the SMP scheduler globals
+(`pxCurrentTCBs`/`xPortSwitchFlag`/`port_xSchedulerRunning`, all in L2MEM .bss).
+Stable result across the whole run:
+```
+TCB[0,1]=0x4ff61a08,0x4ff61f68   <- both cores HAVE a current task (not the issue)
+swflag[0,1]=0,0                  <- xPortSwitchFlag never set, either core
+schedrun[0,1]=0,0                <- port_xSchedulerRunning never set, either core
+core1 pc=0x400283ce              <- core 1 spinning in `while(port_xSchedulerRunning[0]==0)`
+```
+**Key source fact:** `port_xSchedulerRunning[coreID]=1` AND `xPortSwitchFlag
+[coreID]=1` are both set **inside `vPortYieldFromISR`** (port.c:675-676), which
+runs in the yield ISR. They are **0 for both cores forever ⇒ `vPortYieldFromISR`
+NEVER runs on either core** ⇒ the crosscore-yield → `vPortYieldFromISR` →
+`rtos_int_exit` → `vTaskSwitchContext` first-task switch never completes.
+
+**Why core 0 "works" anyway but core 1 can't:** core 0 reaches initArduino/runs
+tasks via the **REAL_SCHED bypass patches** (which substitute for the real
+crosscore-yield scheduler delivery). Core 1, in `esp_startup_start_app_other_cores`,
+faithfully spins on `while(port_xSchedulerRunning[0]==0)` (disasm @0x400283ce-d4)
+waiting for core 0's scheduler-running flag that the bypassed path never sets →
+core 1 hangs there (or, with different timing, falls through to `xPortStartScheduler`
+→ returns → `abort` → reboot, as seen earlier).
+
+**This reframes the whole dual-core completion:** it is NOT a small core-1 patch.
+The real fix is to make the **crosscore-yield → `vPortYieldFromISR` →
+`rtos_int_exit` → `vTaskSwitchContext` context switch actually fire** in our model
+(so `port_xSchedulerRunning`/`xPortSwitchFlag` get set and tasks dispatch on BOTH
+cores **without** the REAL_SCHED bypasses). That means the yield crosscore IRQ
+(`cause=32` → `_interrupt_handler` → `_global_interrupt_handler` → `esp_crosscore_isr`
+REASON_YIELD → `vPortYieldFromISR`) must run end-to-end. Today `esp_crosscore_isr`
+(`0x4ff00e4a`) evidently isn't reached / doesn't set the flags from the yield ISR
+on either core — the next concrete step is to watch core 0's first yield ISR with
+the per-core log and find where `_global_interrupt_handler`'s dispatch to
+`esp_crosscore_isr` / `vPortYieldFromISR` diverges. Fixing that is what the
+REAL_SCHED bypasses have been papering over since Phase 2.DV — and it's the real
+prerequisite for genuine dual-core.
+
+**Reference (Espressif QEMU S3, Xtensa):** the S3 models per-core interrupt
+routing via a SINGLE `Esp32s3IntMatrixState` with `DEFINE_PROP_LINK("cpu0"/"cpu1")`
+to both CPUs — the matrix delivers each source to the correct core. Our P4 uses
+two matrix instances (intmtx/intmtx1); the equivalent must ensure the yield source
+dispatches `esp_crosscore_isr` on the right core's handler table.
+
+**Web:** the APP-CPU `xPortStartScheduler`-returns→`abort()` is a known IDF failure
+mode; common causes are the first-task context switch not completing / stack
+corruption on the secondary core — consistent with the above.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
