@@ -772,11 +772,28 @@ decreasing) → silent reset.
 
 `0x4ff0f670` IS within the HP L2MEM RAM region (`0x4FF00000` + 768 KB), so either
 (a) the ISR/task stack is mis-placed into the `.iram0.text` area, or (b) a
-read-only overlay covers `0x4ff0f000`. **Next:** check `xIsrStackTop[]` / the ISR
-stack placement vs the `.iram0.text` load, and whether anything maps `0x4ff0f000`
-read-only. This is the real blocker now that partitions are understood as a
-non-fatal warning. Headline unchanged: **both cores' schedulers run and the boot
-reaches loopTask.**
+read-only overlay covers `0x4ff0f000`.
+
+**Pinned (ELF section headers):** `.iram0.text` is `0x4FF00000`–`0x4FF0F680`;
+`sp=0x4ff0f670` is the **very end of `.iram0.text` (CODE)**, NOT the ISR stack —
+`xIsrStack` is at `0x4FF12A00` (`.dram0.bss`) and `xIsrStackTop` at `0x4FF14B64`.
+So the ISR's `sp` is NOT pointing at `xIsrStack`. And IDF sets up **PMP** to make
+`.iram0.text` no-write (QEMU RISC-V enforces PMP), so a push to `sp=0x4ff0f670`
+(inside the no-write code region) → `fault_store`.
+
+**Root:** during interrupt handling the ISR stack switch
+(`rtos_int_enter` → `xIsrStackTop[core]`) is wrong/missing, so `sp` stays at the
+end of `.iram0.text` (PMP no-write) instead of `xIsrStack` → the register push
+faults → `_panic_handler` double-faults → silent reset. This likely ties back to
+the `rtos_int_enter` `port_xSchedulerRunning`-gated early-exit (it skips the ISR
+stack push when schedrun==0) interacting with the still-bootstrapping dual-core
+scheduler. **Next:** verify `xIsrStackTop[core]` is initialized and that
+`rtos_int_enter` switches `sp` to it for this interrupt; or confirm the PMP config
+and whether the faulting context is a task whose `sp` was already corrupt.
+
+Headline unchanged: **both cores' schedulers run and the boot reaches loopTask** —
+the remaining crash is an ISR-stack-switch / PMP fault during interrupt handling,
+precisely located for the next session.
 
 ## Risks / notes
 
