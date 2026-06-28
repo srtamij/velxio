@@ -745,6 +745,39 @@ resets *silently* (pcsampler: TCB=0,0, `schedrun=0xFFFFFFFF`, core1 at ROM reset
 `0x4FC00000`). A different, later fault now occurs (past the partition load), with
 no UART error printed. Partition "No MD5" is resolved; the next issue is downstream.
 
+### ⚠️ Partition restore REVERTED — it clobbered app code; "No MD5" is non-fatal
+
+`-d int` traced the faults. The broad restore (flash 0..0x10000 → cache window)
+**clobbered app code** the `-kernel` ELF had loaded at the same VMAs:
+`illegal_instruction` at `0x4000bb90` = **`pmu_init`** and `0x400080ea` =
+**`panic_handler`** / `0x400080de` = `startup_resume_other_cores` — all real app
+functions in `.flash.text` whose cache-window VMAs (`0x4000xxxx`) OVERLAP the
+identity-mapped partition table (`0x40008xxx`). So the partition table and app code
+**fundamentally conflict** at the same cache-window address; any restore that fixes
+one breaks the other. And `load_partitions` "No MD5" is a **NON-FATAL warning** —
+the app reached `loopTask` with it. **Reverted the restore.**
+
+### 🎯 The REAL post-loopTask crash — ISR stack pointer points into code
+
+After the revert, `-d int` shows the genuine first fault:
+```
+async:0 cause:7 (fault_store) epc:0x4ff0d5b8 tval:0x4ff0f67c
+```
+`0x4ff0d5b8` = `_global_interrupt_handler+2` doing `sw ra,12(sp)`; the store target
+`0x4ff0f67c` ⇒ **sp = 0x4ff0f670**, which is inside the **`.iram0.text` (CODE)
+region** (between `spi_flash_*` functions). So during interrupt handling the ISR
+stack pointer points into code, and the push faults → `_panic_handler` (0x4ff00102)
+then double-faults storing its own register dump (tval 0x4ff0f5d4, 0x4ff0f534…
+decreasing) → silent reset.
+
+`0x4ff0f670` IS within the HP L2MEM RAM region (`0x4FF00000` + 768 KB), so either
+(a) the ISR/task stack is mis-placed into the `.iram0.text` area, or (b) a
+read-only overlay covers `0x4ff0f000`. **Next:** check `xIsrStackTop[]` / the ISR
+stack placement vs the `.iram0.text` load, and whether anything maps `0x4ff0f000`
+read-only. This is the real blocker now that partitions are understood as a
+non-fatal warning. Headline unchanged: **both cores' schedulers run and the boot
+reaches loopTask.**
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;

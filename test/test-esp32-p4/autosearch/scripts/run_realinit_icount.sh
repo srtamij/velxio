@@ -8,9 +8,12 @@ QEMU="$HOME/qemu-p4-build/qemu-system-riscv32"
 export VELXIO_REAL_SCHED=1 VELXIO_REAL_INIT=1 VELXIO_CORELOG=1
 export ESP32P4_ROM_ELF=/mnt/c/Desarrollo/velxio/third-party/esp-rom-elfs/esp32p4_rev0_rom.elf
 SHIFT="${1:-2}"
-rm -f /tmp/ic_err.txt /tmp/ic_out.txt
+rm -f /tmp/ic_err.txt /tmp/ic_out.txt /tmp/ic_trace.log
+DTRACE="${2:-}"   # pass "int" as 2nd arg to capture exceptions/interrupts
+DARG=""
+[ -n "$DTRACE" ] && DARG="-d ${DTRACE} -D /tmp/ic_trace.log"
 timeout -s KILL 18 "$QEMU" -accel tcg,thread=single -smp 2 -icount "shift=${SHIFT}" \
-  -M esp32p4 -kernel "$BASE/blink.ino.elf" \
+  $DARG -M esp32p4 -kernel "$BASE/blink.ino.elf" \
   -drive file="$BASE/blink.ino.merged.bin",if=mtd,format=raw -nographic \
   >/tmp/ic_out.txt 2>/tmp/ic_err.txt
 echo "exit=$? (icount shift=${SHIFT})"
