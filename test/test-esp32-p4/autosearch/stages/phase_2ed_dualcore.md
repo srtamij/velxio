@@ -795,6 +795,27 @@ Headline unchanged: **both cores' schedulers run and the boot reaches loopTask**
 the remaining crash is an ISR-stack-switch / PMP fault during interrupt handling,
 precisely located for the next session.
 
+### Refinement — `xIsrStackTop` is CORRECT; `rtos_int_enter` didn't switch for this IRQ
+
+Runtime read-back (pcsampler): `xIsrStackTop[0]=0x4FF13230`, `[1]=0x4FF13A60` —
+both **correct** (in `.dram0.bss`, writable). So the ISR stack tops are fine. At
+the fault, `sp=0x4ff0f670 ≠ xIsrStackTop[0]`, so `rtos_int_enter` did **not** switch
+`sp` to the ISR stack for this interrupt. The interrupted context's `sp≈0x4ff0f6f0`
+sits right at the `.dram0.data`/`.iram0.text` boundary (`.dram0.data` starts at
+`0x4FF0F680`), so `_interrupt_handler`'s `addi sp,sp,-128` push crosses down into
+the PMP-no-write `.iram0.text` → `fault_store`. (Late pcsampler samples with
+`schedrun=0xFFFFFFFF`, `TCB=0` are the POST-reset aftermath, not the live state —
+the live state has `schedrun=1,1` and correct `isrtop`.)
+
+So the precise remaining question: WHY does `rtos_int_enter` not switch to the ISR
+stack for this interrupt, and WHY does the interrupted context have `sp` at the
+`.dram0.data` boundary (a near-exhausted / mis-placed stack)? Candidates: a nested
+interrupt (`port_uxInterruptNesting>0` → `rtos_int_enter` skips the stack switch by
+design), or a context (early task / bootstrap) whose stack base is the start of
+`.dram0.data`. Next: a per-instruction trace of the exact fault moment (which
+function was interrupted, its `sp`, and whether `rtos_int_enter` took the
+early-exit) — the diagnostic infra (corelog, pcsampler, `-d int`) is in place.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
