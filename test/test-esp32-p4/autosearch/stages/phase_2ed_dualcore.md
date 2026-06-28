@@ -610,9 +610,45 @@ clear = `WRITE_PERI_REG(FROM_CPU_n, 0)`, get_state = `REG_READ(FROM_CPU_n)`. Our
 line, read→stored value). So the storm is NOT a missing/!modelled clear — the
 crosscore line lowers correctly when the ISR clears it. The storm is the
 *symptom* of the context switch not completing (the timing race), not a wiring
-gap. Remaining concrete leads for next session: #2 (rtos_int_enter/exit schedrun
-bootstrap ordering) and #3 (TCG round-robin quantum / -icount experiment to
-confirm it's purely timing).
+gap.
+
+### ✅ Lead #2 (schedrun bootstrap ordering) — RULED OUT as a firmware bug
+
+Read `portasm.S` `rtos_int_enter` (:493) and `rtos_int_exit` (:624). Both early-
+exit when `port_xSchedulerRunning[coreID]==0`. BUT the bootstrap is correct by
+design: on the first yield, `_interrupt_handler` calls `rtos_int_enter` (early-
+exits, schedrun==0) → then `_global_interrupt_handler` → `esp_crosscore_isr` →
+`vPortYieldFromISR` (which **sets** `port_xSchedulerRunning[coreID]=1` +
+`xPortSwitchFlag[coreID]=1`) → THEN `rtos_int_exit` reads schedrun (now 1) and
+switches. So the firmware ordering bootstraps correctly within one ISR — not the
+bug. The real problem is upstream: `vPortYieldFromISR` doesn't run untraced.
+
+### ✅✅ Lead #3 (-icount) — CONFIRMS timing AND FIXES core 0's scheduler
+
+Ran with `-icount shift=2` (deterministic instruction-counted timing,
+`run_realinit_icount.sh`). Result vs the default real-time run:
+| | default (RT) | `-icount shift=2` |
+|---|---|---|
+| core0 IRQs | 105× cause=33 (yield STORM) | 178× cause=17 (TICK), 1× yield |
+| core0 `schedrun[0]` | **0** (scheduler dead) | **1** (scheduler RUNNING ✓) |
+| core0 `pxCurrentTCB` | static | **switched** (0x4ff61a08→0x4ff63660 ✓) |
+| core1 | hangs on port_xSchedulerRunning[0] | passes it, then `abort()` |
+
+**Major:** `-icount` removes the yield storm and **core 0's real FreeRTOS
+scheduler now runs** (`vPortYieldFromISR` fires, `schedrun[0]=1`, tasks switch) —
+this is the first time the genuine scheduler works on core 0 in the dual-core
+boot. It **confirms the storm was a pure TCG round-robin timing artifact** and
+that `-icount` is the right execution mode for the dual-core REAL_INIT path.
+
+**Remaining (now cleanly isolated to core 1):** with `-icount`, core 1 gets PAST
+the `port_xSchedulerRunning[0]` wait (so core 0 set it) and reaches its own
+`xPortStartScheduler` → `vPortYield`, but its first-task switch still fails
+(`schedrun[1]=0`, 1× cause=32 yield then `abort()`). So `vPortYieldFromISR` runs
+on core 0 but NOT on core 1. Next: with `-icount` as the baseline, find why core
+1's yield ISR (cause=32 → `_global_interrupt_handler` → `esp_crosscore_isr` →
+`vPortYieldFromISR`) doesn't reach `vPortYieldFromISR` — likely core 1's
+interrupt handler table / `esp_crosscore_int_init`-registered handler for its
+crosscore source, or the reason[] (REASON_YIELD) not seen on core 1.
 
 ## Risks / notes
 
