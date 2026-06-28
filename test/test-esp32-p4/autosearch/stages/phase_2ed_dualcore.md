@@ -686,6 +686,33 @@ dual-core scheduler is no longer the blocker — the next issue is much later
 (partition-table MD5 / a fault in the running app). The dual-core scheduler
 delivery is essentially fixed; remaining work is downstream boot fidelity.
 
+### Partition blocker — root cause = flash-blob clobbered by the -kernel ELF load
+
+`load_partitions()` (`esp_partition/partition.c`) `spi_flash_mmap()`s flash
+`0x8000` and scans 32-byte entries for the MD5 magic `0xEBEB`. The merged.bin
+HAS a valid table (dumped: `0xAA50` entries nvs/otadata/app0/app1/spiffs/coredump,
+then `0xEBEB` at flash `0x80C0`). But a machine-init read-back of the **extflash
+cache window** shows it is CLOBBERED:
+```
+*(0x40008000) = 0x8fd98351   (expected ...0x50AA partition magic)
+*(0x400080C0) = 0x079300f1   (expected low16 0xEBEB MD5 magic)
+```
+So the flash blob's partition table at extflash `0x40008000` was overwritten —
+the **`-kernel` ELF load and the `-drive` flash-blob load conflict in the cache
+window** (`0x40000000+`). The app ELF's segments land in the same cache-window
+region the blob's partition table occupies; whichever loads last wins, and the
+ELF clobbered `0x40008000`. `load_partitions`'s mmap then reads ELF code instead
+of the table → no `0xEBEB` → "No MD5 found" → `0x105` → (eventually) a double-fault.
+
+**Fix direction (next session — a Phase-2.T-class flash-MMU change):** serve
+`spi_flash_mmap`/`esp_flash_read` of the partition table (and other flash regions)
+from a **separate, un-clobbered flash backing** (the raw merged.bin), independent
+of the cache-window RAM the ELF writes — OR fix the load so the ELF only writes
+IRAM/DRAM + the app's own flash-cache pages and never the partition-table page.
+This is downstream of the (now-fixed) dual-core scheduler; the headline result
+stands: **both cores' real FreeRTOS schedulers run and the boot reaches the
+Arduino loopTask.**
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
