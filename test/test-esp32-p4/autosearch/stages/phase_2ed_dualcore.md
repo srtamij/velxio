@@ -704,13 +704,24 @@ region the blob's partition table occupies; whichever loads last wins, and the
 ELF clobbered `0x40008000`. `load_partitions`'s mmap then reads ELF code instead
 of the table → no `0xEBEB` → "No MD5 found" → `0x105` → (eventually) a double-fault.
 
-**Fix direction (next session — a Phase-2.T-class flash-MMU change):** serve
-`spi_flash_mmap`/`esp_flash_read` of the partition table (and other flash regions)
-from a **separate, un-clobbered flash backing** (the raw merged.bin), independent
-of the cache-window RAM the ELF writes — OR fix the load so the ELF only writes
-IRAM/DRAM + the app's own flash-cache pages and never the partition-table page.
-This is downstream of the (now-fixed) dual-core scheduler; the headline result
-stands: **both cores' real FreeRTOS schedulers run and the boot reaches the
+**Caveat — the `0x40008000` read may be a red herring; cross-ref Phase 2.T.**
+`load_partitions` `spi_flash_mmap`s flash `0x0` to a *dynamically-allocated* cache
+vaddr and reads the table at `vaddr+0x8000` — NOT necessarily the identity address
+`0x40008000` I read back. So `0x40008000` being clobbered (ELF code) doesn't by
+itself prove the guest's mmap'd read is wrong. The prior **Phase 2.T**
+investigation (`phase_2t_partition_blocker.md`) concluded the cache-MMU eager-copy
+(`esp32p4_mmu_eager_translate`, copies `flash_blob[]`→extflash on MMU writes) is
+robust and that `spi_flash_mmap` CAN map — its blocker then was the *absent real
+scheduler* (locks/spinlocks misbehaving), which is now FIXED.
+
+**Fix direction (next session):** with the real dual-core scheduler now present,
+re-exercise the partition mmap and verify the **eager-copy serves the guest's
+actual mmap'd vaddr** for the partition-table page — specifically that the MMU's
+`flash_blob[]` mirror is populated with the merged.bin (so the copy yields the
+real table incl. `0xEBEB` at flash `0x80C0`), and that the mmap of flash `0x0`
+(page-aligned) maps the bootloader+partition region rather than an ELF-clobbered
+page. This is downstream of the (now-fixed) dual-core scheduler; the headline
+result stands: **both cores' real FreeRTOS schedulers run and the boot reaches the
 Arduino loopTask.**
 
 ## Risks / notes
