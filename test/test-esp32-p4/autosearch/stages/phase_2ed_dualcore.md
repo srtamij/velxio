@@ -816,6 +816,30 @@ design), or a context (early task / bootstrap) whose stack base is the start of
 function was interrupted, its `sp`, and whether `rtos_int_enter` took the
 early-exit) — the diagnostic infra (corelog, pcsampler, `-d int`) is in place.
 
+### 🎯 CONVERGENCE — the remaining failure is the dual-core flash-op IPC ack
+
+`-d int` of another run (the behaviour is still timing-sensitive: sometimes the
+fault_store above, sometimes this) shows core 0 stuck in an **interrupt storm at
+epc=`0x4ff0091a`** — which disassembles to a spin loop INSIDE
+**`spi_flash_disable_interrupts_caches_and_other_cpu`**:
+```
+4ff0091a: lbu  a5,-1541(s1)
+4ff0091e: beqz a5,4ff0091a      ; while (other_cpu_stalled_flag == 0) spin
+```
+So core 0 calls the dual-core flash-op, sends the stall IPC to core 1, and **spins
+waiting for core 1 to acknowledge being stalled** — exactly the original IPC theme.
+core 1's scheduler now runs (`schedrun[1]=1`), but its **`ipc_task` still doesn't
+run `spi_flash_op_block_func`** to set the ack flag → core 0 spins forever (with the
+periodic tick/yield IRQs storming on top).
+
+**Both observed failure modes (the ISR-stack fault_store and this spi_flash spin)
+converge on the same unfinished piece: core 1's `ipc_task` servicing the cross-core
+request.** Now that both schedulers run, the final dual-core step is to get core 1
+to actually dispatch `ipc_task` and run the IPC/stall callback (and to make the
+interrupt delivery robust so it doesn't storm). This is the convergent remaining
+work — deep FreeRTOS-SMP task-dispatch on the emulated app cpu, on top of the
+now-working scheduler + correct interrupt-matrix routing.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
