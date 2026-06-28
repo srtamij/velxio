@@ -650,6 +650,42 @@ on core 0 but NOT on core 1. Next: with `-icount` as the baseline, find why core
 interrupt handler table / `esp_crosscore_int_init`-registered handler for its
 crosscore source, or the reason[] (REASON_YIELD) not seen on core 1.
 
+### ✅✅✅ ROOT CAUSE + FIX — the interrupt-matrix line was OFF BY +16 (double-counted)
+
+Scanned `s_intr_handlers[core][0..31]` (per-core handler table) for
+`esp_crosscore_isr` (0x4ff00e4a) via the PC sampler: found it at **core0 intr 1**
+and **core1 intr 0** — NOT at intr 17/16 (=cause−16) as our raised cause implied.
+The crosscore yield raised `cause=33` (core0) / `cause=32` (core1), so
+`intr_get_item(cause−16)` = `[0][17]`/`[1][16]` = EMPTY → the handler never ran →
+`vPortYieldFromISR` never set the switch flag.
+
+**The bug:** `esp_rom_route_intr_matrix(cpu, source, intr)` writes the matrix MAP
+register with `intr + RV_EXTERNAL_INT_OFFSET` (= the CLIC cause the CPU sees; IDF
+`_global_interrupt_handler` does `intr_get_item(mcause − 16)`). So the MAP value
+**already is the cause**. Our `esp32p4_intmtx_line` did `(map & 0x1F) + 16` —
+adding the +16 offset a SECOND time. Core1 MAP=16 (intr 0) → raised line 32 (vs the
+real cause 16); core0 MAP=17 (intr 1) → raised 33 (vs 17). **Fix:** use the MAP
+value directly (`line = map[src] & 0x3F`) — it is the cause.
+
+**Verified after the fix (`-icount`, dual-core REAL_INIT):**
+- **`schedrun[0,1]=1,1`** — BOTH cores' FreeRTOS schedulers now run (core 1's was
+  stuck at 0 forever before).
+- core 1's yield now arrives as **`cause=16`** (correct) and dispatches to
+  `esp_crosscore_isr` → `vPortYieldFromISR`.
+- **`loopTask` now runs** — the boot advances past `initArduino` into the Arduino
+  loop task.
+- **No regression:** single-core REAL_SCHED blink still toggles GPIO2.
+
+This is the real fix the REAL_SCHED bypasses masked since 2.DV: with the matrix
+line correct, the genuine crosscore-yield scheduler delivery works on BOTH cores.
+
+**New (later) blocker:** the boot now reaches the **partition subsystem** (UART0
+logs `E partition: No MD5 found in partition table` / `load_partitions returned
+0x105`) and then double-faults (`Panic handler entered multiple times`). So the
+dual-core scheduler is no longer the blocker — the next issue is much later
+(partition-table MD5 / a fault in the running app). The dual-core scheduler
+delivery is essentially fixed; remaining work is downstream boot fidelity.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
