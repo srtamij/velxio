@@ -724,6 +724,27 @@ page. This is downstream of the (now-fixed) dual-core scheduler; the headline
 result stands: **both cores' real FreeRTOS schedulers run and the boot reaches the
 Arduino loopTask.**
 
+### ✅ Partition "No MD5" FIXED (restore the bootloader+parttable region)
+
+Instrumented `esp32p4_mmu_eager_translate` (gated by CORELOG): it fires **0 times**
+across the whole boot — the firmware **never programs the flash MMU**, because the
+app is pre-loaded into the cache window by the `-kernel` ELF (the real bootloader,
+which would program the MMU, is skipped). So `spi_flash_mmap` of the partition
+table reads the **identity-mapped** cache window directly — and that region was
+CLOBBERED by the ELF pre-load (`*(0x40008000)=0x8fd98351`, not the `0x50AA` magic).
+The MMU's `flash_blob[]` mirror is ALSO empty (`flash_size < 0x10000`).
+
+**Fix (REAL_INIT-gated):** at end of machine_init, `blk_pread` the first `0x10000`
+bytes (bootloader + partition table) of the `-drive` merged.bin directly into the
+extflash cache window, restoring the un-clobbered partition table. Verified:
+`*(0x400080C0)=0xffffEBEB` (the `0xEBEB` MD5 magic is back) and the
+**`E partition: No MD5 found` error is GONE** (count 0). No single-core regression.
+
+**New (further) blocker:** the boot still doesn't reach `loop()`/GPIO2 — it now
+resets *silently* (pcsampler: TCB=0,0, `schedrun=0xFFFFFFFF`, core1 at ROM reset
+`0x4FC00000`). A different, later fault now occurs (past the partition load), with
+no UART error printed. Partition "No MD5" is resolved; the next issue is downstream.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
