@@ -891,6 +891,33 @@ lock/stack abort → …). Each pragmatic unblock reveals the next; reaching a s
 setup()/loop() needs the ISR-stack/lock robustness resolved (which loops back to
 the rtos_int_enter ISR-stack-switch finding above).
 
+### ✅ ROOT FIX — model the SYSTIMER tick ack (INT_CLR) → storm 178 → 17
+
+The interrupt storm's root: our systimer raised the tick IRQ each period but NEVER
+de-asserted it, so after the FreeRTOS tick ISR returned the level-triggered line
+stayed high and re-fired immediately. That storm piled up
+`port_uxInterruptNesting`, so `rtos_int_enter` kept taking the `nesting>0`
+early-exit and never switched `sp` to `xIsrStackTop` (sp overflowed into PMP
+`.iram0.text` → the fault_store). **Fix:** model the real ack —
+`SYSTIMER_INT_CLR_REG` (offset 0x6C) write with `TARGET0_INT_CLR` de-asserts
+`irq_target0` (the tick ISR's `systimer_ll_clear_alarm_int`). **Verified:**
+dual-core core0 tick IRQs drop **178 → 17** (storm gone, edge-like); no single-core
+regression (REAL_SCHED blink toggles GPIO2). This is the faithful root fix for the
+interrupt storm.
+
+### Next layer — `lock_acquire_generic` abort (mintstatus / lock-in-ISR)
+
+The storm fix didn't clear the downstream `abort()` at `0x4ff01b6f`. Disasm:
+`lock_acquire_generic` reads **CSR 0x346 (`mintstatus`** = CLIC interrupt level),
+extracts bits[31:29], and if non-zero (interrupt context) AND the mutex type isn't
+recursive (`s2 != 4`) → `abort` (called from `esp_vApplicationTickHook`'s tick_cb).
+Two candidates: (a) our **`mintstatus` is a scratch CSR** (esp_cpu.c) — it doesn't
+model the hardware interrupt-level (set on trap entry, restored on mret), so the
+ISR-context check can read a wrong value; (b) the mutex type field (`s2`) is wrong
+(corrupt mutex) so the recursive path is skipped. Next: model `mintstatus.mil`
+from the actual interrupt nesting (0 outside ISRs, the level inside), and verify
+the tick_cb's mutex is intact. The diagnostic infra + `-d int` are in place.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
