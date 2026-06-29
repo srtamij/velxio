@@ -840,6 +840,35 @@ interrupt delivery robust so it doesn't storm). This is the convergent remaining
 work — deep FreeRTOS-SMP task-dispatch on the emulated app cpu, on top of the
 now-working scheduler + correct interrupt-matrix routing.
 
+### ✅ Progress — `ipc_task` NOW RUNS; narrowed to the callback registration
+
+`-d in_asm` of the flash-op (post offset-fix): the IPC chain now executes —
+`esp_crosscore_int_send:8`, `esp_crosscore_isr:14`, **`ipc_task:4`** (was 0 before
+the interrupt-matrix fix!), `vTaskSwitchContext:29`. So `ipc_task` IS dispatched on
+core 1 now. But **`spi_flash_op_block_func:0`** — `ipc_task` runs yet never executes
+the requested callback.
+
+**Mechanism (esp_ipc.c):** `esp_ipc_call_nonblocking(core1, func)` registers the
+callback via `esp_cpu_compare_and_set(&s_no_block_func[1], 0, func)` (RISC-V
+`lr.w`/`sc.w` CAS, `rv_utils_compare_and_set`), sets the ready flag, then
+`vTaskNotifyGiveFromISR(s_ipc_task_handle[1])`. `ipc_task` wakes
+(`ulTaskNotifyTake`) and, if `s_no_block_func[cpuid]` is set, calls it.
+
+**Read-back (pcsampler):** `ipc_task_handle[1]=0x4ff61f68` (ipc_task[1] exists ✓),
+but **`s_no_block_func[1]=0x00000000` in every sample** (expected
+`0x4ff0081e`=spi_flash_op_block_func) and `ready[1]=0`. So the callback pointer is
+never persistently registered → `ipc_task` wakes but finds nothing to run → the
+ack flag is never set → core 0 spins.
+
+**Precise convergent root for next session:** the IPC callback registration
+(`esp_cpu_compare_and_set` LR/SC CAS on `s_no_block_func[1]`) and/or the cross-core
+`vTaskNotifyGiveFromISR` wake of `ipc_task[1]` doesn't land — likely the RISC-V
+`lr.w`/`sc.w` atomic CAS not behaving across the two round-robin TCG cores (the
+load reservation across the core switch), or the task-notify not reaching the
+core-1-pinned `ipc_task`. This is the single, precise remaining blocker; the
+diagnostic infra (corelog, pcsampler with IPC fields, `-d in_asm`/`-d int`) is in
+place to pin LR/SC vs notify next.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
