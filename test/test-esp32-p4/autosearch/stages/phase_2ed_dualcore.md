@@ -869,6 +869,28 @@ core-1-pinned `ipc_task`. This is the single, precise remaining blocker; the
 diagnostic infra (corelog, pcsampler with IPC fields, `-d in_asm`/`-d int`) is in
 place to pin LR/SC vs notify next.
 
+### ✅ Pragmatic flash-op unblock (reach toward setup/loop) — advances, cascade continues
+
+Per the priority "get to setup()/loop()", applied a REAL_INIT-only emulation
+shortcut: the dual-core flash-op stall of core 1 is **unnecessary in emulation**
+(no flash-cache coherency hazard — flash reads come from the RAM mirror), so core 0
+needn't wait for core 1's ack. Patched the `while (!s_flash_op_can_start)` spin's
+guard (`0x4ff0091e` `c.beqz`→`c.nop` 0x0001) so it falls through. Verified the patch
+lands (`*(0x4ff0091e)=0x0001`) and **the boot advances past the flash-op spin**. No
+single-core regression (REAL_INIT-only; REAL_SCHED blink toggles GPIO2).
+
+**Cascade continues — next blocker:** past the flash-op spin, the boot hits a
+`__stack_chk` / lock abort: `abort() at 0x4ff01b6f` (inside `lock_acquire_generic`,
+the newlib mutex), `RA=esp_vApplicationTickHook`, with stack-canary-looking
+registers (`T0=0x37363534`="4567", `T2=0x33323130`="0123") → `panic_abort` then
+`illegal_instruction` → reboot. So a newlib-lock / stack-corruption abort in the
+tick-hook context now occurs — likely the SAME ISR-stack issue (sp into PMP code)
+resurfacing in the tick hook, or a mutex acquired from a bad context. Still NOT at
+setup()/loop(); the dual-core boot is a multi-blocker cascade (flash-op spin →
+lock/stack abort → …). Each pragmatic unblock reveals the next; reaching a stable
+setup()/loop() needs the ISR-stack/lock robustness resolved (which loops back to
+the rtos_int_enter ISR-stack-switch finding above).
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
