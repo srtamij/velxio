@@ -918,6 +918,34 @@ ISR-context check can read a wrong value; (b) the mutex type field (`s2`) is wro
 from the actual interrupt nesting (0 outside ISRs, the level inside), and verify
 the tick_cb's mutex is intact. The diagnostic infra + `-d int` are in place.
 
+### ✅ ROOT FIX #2 — model `mintstatus.mil`; the abort is PANIC AFTERMATH
+
+Modelled `mintstatus` (CSR 0x346) faithfully: a per-CPU `intr_level` counter, `++`
+on interrupt entry (`esp_cpu_exec_interrupt`), `--` on `mret` (new
+`esp_cpu_handle_mret` hook in `helper_mret`, no-op for non-Esp CPUs); the 0x346 read
+returns `intr_level << 24` (mil), so it's non-zero while in an ISR and 0 in task
+context. No single-core regression (blink toggles GPIO2). Correct CLIC behavior, a
+permanent fidelity improvement (`commit 87cadd43d3`).
+
+But it didn't clear the `lock_acquire_generic` abort — because that abort is **panic
+aftermath, not the primary fault**. The real caller chain (`-d in_asm`) is
+`esp_log_timestamp → esp_log_impl_lock_timeout → lock_acquire_generic` from within
+an `xQueueGiveFromISR`, and the console shows it is the **core-dump path**:
+```
+E (173) partition: No MD5 found in partition table / load_partitions returned 0x105
+E (435) esp_core_dump_flash: Core dump flash config is corrupted! ...
+E (435) esp_core_dump_common: Core dump write failed with error=-1
+```
+So an original panic fires → `esp_core_dump_*` tries to write a core dump → it fails
+(our flash backing isn't a valid core-dump partition) → it logs the failure → the
+log acquires a recursive lock from the panic/ISR context → `lock_acquire_generic`
+aborts (a SECONDARY abort). **Next:** find the PRIMARY panic (look before the
+`esp_core_dump` lines for the first `Guru`/abort/assert), and/or disable the flash
+core dump so the secondary abort stops masking it. Net this session: **two faithful
+root fixes (SYSTIMER INT_CLR ack + mintstatus.mil), no regressions**; the boot now
+panics-and-core-dumps instead of silently storming — the primary panic is the next
+precise target.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
