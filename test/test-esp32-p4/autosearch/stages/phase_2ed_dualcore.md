@@ -1066,6 +1066,33 @@ blocker — is FIXED; the real ESP32-P4 dual-core boot now runs cleanly into
 `initArduino`. The remaining gap to `setup()/loop()` is the `spi_flash_mmap`
 partition-table read, a well-scoped flash-MMU fidelity task.
 
+### 🎉 MILESTONE — real dual-core boot reaches setup()/loop() and toggles GPIO2
+
+Root of the `spi_flash_mmap` "No MD5" failure: the machine-init flash loader copied
+`merged.bin` into the extflash **cache window** (0x40000000, identity) but **never
+into `g_esp32p4_mmu->flash_blob`, and never set `flash_size`** (stayed 0). App code
+runs from the ELF-loaded identity window, so this went unnoticed — but the app-time
+`spi_flash_mmap` REMAPS arbitrary pages (traced: it writes MMU `index=5`,
+`content=0x1000` = VALID|page 0 → maps vaddr `0x40050000` to flash page 0 to read the
+partition table). The eager-translate needs `flash_blob`+`flash_size` to serve a
+remap; with `flash_size=0` it returned early (`[mmudbg] flash_size=0x0`) and the read
+got garbage → "No MD5".
+
+**Fix:** also `blk_pread` the blob into `g_esp32p4_mmu->flash_blob` and set
+`flash_size` at machine init. **Result:**
+- `[esp32p4] loaded 4194304 bytes into MMU flash_blob (spi_flash_mmap now served)`
+- eager-translate now fires for the partition mapping; **"No MD5" is GONE**;
+- **the dual-core REAL_INIT boot toggles GPIO2 (`pin 2 -> 1`)** — which requires
+  `pinMode(2,OUTPUT)`+`digitalWrite(2,HIGH)`, i.e. **`setup()`/`loop()` executed** —
+  with **no crash/abort** and no single-core regression (blink GPIO2 intact).
+
+**This is the end-to-end goal for Track A: the REAL, unmodified ESP-IDF + Arduino
+dual-core firmware now boots on the emulated ESP32-P4 all the way to the Arduino
+sketch's GPIO output.** (Under `-icount shift=2` virtual time is slow, so the 1 s
+blink delay yields ~1 toggle per window; faster/real-time pacing shows continuous
+blink.) Remaining polish: continuous-blink stability + broaden beyond the blink
+sketch. But the hardest arc — real dual-core boot to setup()/loop() — is DONE.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
