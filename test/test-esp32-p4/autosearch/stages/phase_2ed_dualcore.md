@@ -1262,6 +1262,35 @@ automatic light sleep for the emulation. Either removes the idle churn so `delay
 elapses at a usable rate. The landmark (real dual-core boot running `setup()/loop()`)
 is not just intact — it is CONFIRMED executing the sketch loop.
 
+### 🎯 EXACT CULPRIT — Arduino-ESP32 automatic light-sleep / DFS in the idle hook
+
+(`CONFIG_PM_ENABLE` is NOT set, so it's not IDF PM — it's Arduino's own idle DFS.)
+Caller histogram in the stall loop:
+```
+setCpuFrequencyMhz  rtc_clk_cpu_freq_to_cpll_mhz(65)  rtc_clk_cpu_freq_set_config(55)
+rtc_clk_cpu_freq_to_xtal(37)  subscribe_idle  esp_register_freertos_idle_hook_for_cpu
+esp_sleep_pd_config(10)  esp_sleep_enable_gpio_switch(10)  esp_sleep_config_gpio_isolate(7)
+```
+So the Arduino idle hook does a **full CPU-frequency switch (XTAL ↔ CPLL/360 MHz) +
+light-sleep power-domain/GPIO config on EVERY idle cycle**. The freq switch
+reconfigures the analog PLL over regi2c (`esp_rom_regi2c_write` + `regi2c_enter/exit`)
+and polls the PMU clock-switch-busy bit (`0x500E6004` bit 4 via base `a6=0x500E6000`)
++ `esp_rom_delay_us` clock-stabilization waits. During `delay(1000)` the idle task
+repeats this hundreds of times → the blink half-period takes ~a minute of wall clock.
+
+**This is Arduino auto-light-sleep, and `loop()` IS running** — the emulation is
+correct, just slow through the DFS path. **Fix directions (concrete):**
+1. Emulation-cheap DFS: make the PMU/PLL clock-switch registers report "switch done"
+   immediately (`0x500E6004` bit 4 read = 0) and stub `esp_rom_delay_us` / the regi2c
+   PLL waits as no-ops so `rtc_clk_cpu_freq_set_config` returns in one shot — removes
+   the per-idle wall-clock cost. (Highest leverage; pure emulation, no guest change.)
+2. Or recognise the Arduino auto-sleep and short-circuit the idle frequency switch.
+3. Sketch-level: `setCpuFrequencyMhz(360)` fixed / disable Arduino auto light-sleep —
+   but that changes the sketch, less faithful.
+
+Direction 1 is the target: keep the real DFS code running but make its
+hardware waits instant in the emulator. The landmark stands and `loop()` executes.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
