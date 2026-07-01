@@ -1190,6 +1190,37 @@ when a masked tick is pending, or investigate `cpu_exec_halt`/`tcg_kick` timing.
 is a dedicated QEMU-internals task; the landmark (boot → setup()/loop()/GPIO2) is
 unaffected and stands.
 
+### ⚠️ CORRECTION — the stall is a busy spi_flash+vTaskDelay loop, NOT a frozen core
+
+The earlier "core 0 frozen / round-robin pathology" conclusion was WRONG — it was an
+artifact of the pcsampler reading a stale `env->pc` for the actively-running core.
+Captured the real execution by streaming the `-d in_asm` trace through `tail -c`
+(keeps the last ~8 MB without filling disk — see `run_realinit_trace_tail.sh`). At
+the stall, core 0 is **executing a tight busy loop**, hottest PCs:
+```
+spi_flash_hal_disable_auto_suspend_mode (0x4ff0b2ea, hottest)
+xTaskResumeAll (0x4ff08924)   prvAddCurrentTaskToDelayedList (0x4ff079fa)
+vTaskPlaceOnEventList (0x4ff082xx)
+```
+Tail histogram: **246 `spi_flash` refs, ~65 suspend/Suspend, 8 `vTaskDelay`**. So a
+task is running a **spi_flash operation loop** (disable auto-suspend → work →
+`vTaskDelay` → `xTaskResumeAll`) over and over. It keeps the CLIC threshold at
+level ≥ 1 (a critical / cache-disabled section), which masks the level-1 tick, so
+the task's own `vTaskDelay` never expires → the loop is **self-sustaining** and the
+blink never advances.
+
+**Revised root & fix direction (supersedes the rr-pathology idea):** this is the
+flash-op path (same family as `spi_flash_disable_interrupts_caches_and_other_cpu`,
+Phase 2.ED flash-op unblock) still looping in the app steady state. The `cpu_exit` /
+rr-kick approach is moot — core 0 is not frozen. Next: (1) identify the exact task
+and the flash op it repeats (grep the tail trace for the caller of
+`spi_flash_hal_disable_auto_suspend_mode` and the `spi_flash_*` entry — likely a
+retry/poll that never succeeds against our flash HAL stub), and (2) make that flash
+op actually complete (so the task stops re-delaying) rather than fight the tick
+masking. My CLIC threshold gate is correct; the real bug is the flash op not
+completing, which keeps the threshold raised. The landmark
+(boot → setup()/loop()/GPIO2) is unaffected.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
