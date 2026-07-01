@@ -1011,6 +1011,32 @@ masked; re-inject on threshold-drop), mirroring how the S3 Xtensa INTC gates del
 by level. That is the single remaining step to break the dual-core deadlock and reach
 setup()/loop().
 
+### ✅✅ FIX LANDED — CLIC threshold gate at the irq-handler level → dual-core reaches initArduino
+
+Implemented the threshold gate correctly at the irq-handler / pending level (not in
+`exec_interrupt`):
+- `esp_cpu_irq_handler`: if the CLIC threshold level ≥ the IRQ level (≈1), DEFER the
+  IRQ (`irq_masked_pending`/`masked_cause`) instead of latching it into MEIP.
+- `esp_cpu_set_clic_thresh`: on a threshold DROP (level ≥1 → <1), re-inject the
+  deferred IRQ via the normal MEIP path so the tick is never lost.
+- Scoped to `VELXIO_REAL_INIT` (`esp_cpu_clic_thresh_gate_enabled()`): the single-core
+  demo/REAL_SCHED tick uses wall-clock timing that the defer/re-inject cycle throttled
+  (regressed GPIO2), and single-core has no spinlock deadlock, so the gate is only
+  enabled for the dual-core real boot.
+
+**Result — the dual-core deadlock/panic is GONE and the boot advances massively:**
+- Single-core REAL_SCHED blink: GPIO2 toggles (no regression).
+- Dual-core REAL_INIT: **no abort/reboot**, tick IRQs flow (198), and the boot now
+  reaches — with NO synchronous fault —
+  `esp_startup_start_app → vTaskStartScheduler → main_task → app_main → **initArduino**`.
+  It runs healthy dual-core flash ops (`spi_flash_disable_interrupts_caches_and_other_cpu`),
+  `_interrupt_handler`, and `vPortExitCriticalMultiCore` without dead-locking.
+
+Before this fix the boot dead-locked/panicked BEFORE loopTask; now it runs cleanly
+through the Arduino init. Remaining gap: `initArduino → setup()/loop()/GPIO2` (either
+the 15 s emulated-time window is too short for the long init, or one more slow flash
+op / blocker inside initArduino). That is the next step.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
