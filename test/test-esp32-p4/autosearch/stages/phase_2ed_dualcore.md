@@ -1305,6 +1305,65 @@ switch), or (b) prevent the Arduino idle hook from switching frequency (guest/sk
 behavior — Arduino auto light-sleep). This is a well-scoped next task; the emulator
 is correct (it runs the real DFS), just not fast through it.
 
+### S3-referenced fix tried: VIRTUAL clock — faithful, but NOT the cause
+
+Studied the S3 systimer (`third-party/espressif-qemu/hw/timer/esp_systimer.c`): it
+drives the tick off **`QEMU_CLOCK_VIRTUAL`** (deterministic, guest-instruction-tied
+under -icount) with a real comparator/`raw_st`/period-reload model. Ours used
+`QEMU_CLOCK_VIRTUAL_RT` (wall clock). Ported the S3 approach: the P4 systimer now uses
+`QEMU_CLOCK_VIRTUAL` when `-icount` is on (the dual-core research runs) and keeps
+`VIRTUAL_RT` for the non-icount demo (which busy-waits on the counter). Gated via
+`icount_enabled()`. **Result: no single-core regression, but the dual-core blink is
+still 1 toggle** — so the wall-clock vs virtual-clock source is NOT the cause.
+
+**Definitive root of the slow blink:** it's the **lost ticks under my CLIC-threshold
+masking**, independent of the clock source. During the Arduino idle DFS, the freq
+switch runs inside critical sections that raise the threshold; the level-1 tick is
+deferred (`irq_masked_pending`), but only the LAST deferred tick is re-injected on the
+threshold drop — if a critical section spans multiple tick periods, the intermediate
+ticks are LOST. FreeRTOS's `xTaskIncrementTick` therefore runs far fewer than 1000
+times, so `delay(1000)` never elapses (only ~1 toggle / long window).
+
+**The real fix (well-scoped, faithful):** a tick **catch-up** — accumulate the count
+of ticks deferred while masked and re-deliver ALL of them once the threshold drops
+(or model the systimer comparator like the S3 so the tick ISR reads the counter and
+advances the FreeRTOS tick by the elapsed periods in one shot). This is the single
+remaining task for a visibly-continuous blink. Everything upstream — real dual-core
+boot, `setup()/loop()`, `gpio_set_level` — is confirmed working.
+
+### Continuous-blink — FOUR emulation fixes tried, none sufficient (negative results)
+
+Per the S3-referenced investigation, tried and REVERTED (all no single-core
+regression, none restored a visibly-continuous blink):
+1. **has_work on `irq_masked_pending`** — no effect (`halt=0`, has_work doesn't gate).
+2. **Bounded safety-valve re-inject** (force a tick masked >250 periods) — more ticks,
+   still no 2nd toggle.
+3. **VIRTUAL clock (S3 model, `esp_systimer.c`)** — switched the systimer to
+   `QEMU_CLOCK_VIRTUAL` under -icount (deterministic, guest-tied). Faithful, but the
+   blink stayed at 1 toggle → the clock source is not the cause.
+4. **Tick catch-up in the systimer** (accumulate `ticks_owed` when the guest doesn't
+   ack, re-fire one per INT_CLR ack to catch up) — still 1 toggle: the guest re-enters
+   the DFS critical section before the backlog can drain, so the tick can't keep pace.
+
+**Conclusion (well-supported):** the continuous-blink limit is NOT an emulation
+interrupt-timing gap that a QEMU-side fix closes. `loop()` runs; the boot is correct;
+but the Arduino idle path does a full XTAL↔CPLL DFS + light-sleep dance every idle
+cycle (`CONFIG_PM_ENABLE` off, so it's Arduino's own auto light-sleep), and under
+single-thread TCG that idle churn dominates wall-clock while masking the tick, so
+`delay()` elapses ~90× slower than real time. The genuinely effective fixes are
+guest/config-level or a much deeper DFS-cost model:
+- **Sketch/config:** disable Arduino auto light-sleep (`setSleep`) or pin the CPU
+  frequency, so the idle task just WFIs — the emulator then blinks at rate. (Least
+  faithful to "unmodified firmware" but the pragmatic path to a visible demo.)
+- **Emulation:** make a full `rtc_clk_cpu_freq_set_config` return in ~zero guest-time
+  (intercept `esp_rom_delay_us` + the PLL-lock waits during a switch) so the idle DFS
+  is cheap — keeps the real DFS code path but removes its per-cycle cost. (Faithful,
+  but substantial — a dedicated phase.)
+
+This is the honest end state: real dual-core ESP32-P4 boot runs the Arduino sketch
+`loop()`; a visibly-continuous blink needs the idle-DFS cost addressed, which is a
+separate, well-scoped task (guest config OR a DFS-cost emulation model).
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
