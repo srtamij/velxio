@@ -975,6 +975,42 @@ then either fix its init or the heap. This is the precise primary blocker now th
 the SYSTIMER-storm and mintstatus root fixes are in and the core-dump secondary is
 understood.
 
+### 🎯🎯 CALLER CAUGHT + ROOT CAUSE PROVEN — dual-core deadlock = tick preempts critical section
+
+Full chain (host-side stack dump when the tick interrupts the spin):
+```
+ipc_task (0x4ff00a34) → xTaskGenericNotify (uses &xKernelLock) → xPortEnterCriticalTimeout
+  → spin on esp_cpu_compare_and_set(&lock->owner, SPINLOCK_FREE=0xB33FFFFF, core_id)
+```
+Spin PC `0x4ff06aaa` = `beqz a0, retry` after `esp_cpu_compare_and_set` — the CAS
+keeps returning false because the lock is HELD. Read-back: **`xKernelLock`
+(0x4ff0f72c) owner=0x0000cdcd (=core 0, SPINLOCK_OWNER_ID_0), count=1..2**. Core 0
+holds the FreeRTOS kernel spinlock; the notify path spins for it → **deadlock**.
+
+**Root cause (proven):** the FreeRTOS tick ISR **preempts a critical section**. On the
+CLIC, critical sections raise `CLIC_INT_THRESH_REG` (0x20800008) to
+`CLIC_INT_THRESH(EXCM_LEVEL-1)` (byte `0x7f`, level 3 for NLBITS=3) to mask
+low-priority interrupts; leaving lowers it to `0x00` (level 0). Our CLIC was a pure
+backing-RAM model that stored the threshold but **never gated delivery**, so the tick
+fired mid-critical-section and ran scheduler code needing `xKernelLock` while core 0
+held it → the spinlock dead-locks. The threshold toggles cleanly `0x00↔0x7f` per-core
+(tracked via `current_cpu`).
+
+**Validation:** a gate in `esp_cpu_exec_interrupt` (mask when threshold level ≥ 1)
+**broke the deadlock** — `klock` spins → 0, no abort/reboot. That PROVES the root
+cause.
+
+**Gate currently DISABLED (regression):** masking via `return false` in
+`exec_interrupt` fights QEMU's MEIP model — in CLIC mode `mie.MEIE=0`, so
+`riscv_cpu_has_work()` won't re-poll a masked IRQ; the deferred tick is dropped
+entirely (core0 tick IRQs → 0, scheduler stops, single-core blink GPIO2=0). A
+`cpu_interrupt(CPU_INTERRUPT_HARD)` re-trigger on threshold-drop didn't recover it.
+So the gate is left off; `cpu->clic_thresh` tracking + `esp_cpu_set_clic_thresh()`
+stay. **Next:** gate at the irq-handler/pending level (don't latch into MEIP while
+masked; re-inject on threshold-drop), mirroring how the S3 Xtensa INTC gates delivery
+by level. That is the single remaining step to break the dual-core deadlock and reach
+setup()/loop().
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
