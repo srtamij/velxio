@@ -1291,6 +1291,20 @@ correct, just slow through the DFS path. **Fix directions (concrete):**
 Direction 1 is the target: keep the real DFS code running but make its
 hardware waits instant in the emulator. The landmark stands and `loop()` executes.
 
+**Update — the clock-switch POLL is already stubbed** (`{0x500E6004 → 0, "clock-switch
+op done"}` in the smart-stub table), so `rtc_clk_cpu_freq_to_xtal`'s bit-4 poll exits
+immediately — the poll is NOT the bottleneck. The remaining cost is the DFS *work
+itself* running every idle cycle: the analog-PLL regi2c reconfig + `esp_rom_delay_us`
+clock-stabilization waits, done inside critical sections (`regi2c_enter_critical`,
+`periph_rcc_enter`) that raise the CLIC threshold and thus DEFER the tick (my gate).
+So while the idle task churns DFS, the tick is masked and `delay(1000)` barely
+advances → ~1 toggle / 90 s. The real fix is to stop the idle task doing a full
+XTAL↔CPLL switch every cycle: either (a) stub `esp_rom_delay_us` / the PLL-lock waits
+so a switch is ~free (needs intercepting ROM delay or the systimer read during the
+switch), or (b) prevent the Arduino idle hook from switching frequency (guest/sketch
+behavior — Arduino auto light-sleep). This is a well-scoped next task; the emulator
+is correct (it runs the real DFS), just not fast through it.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
