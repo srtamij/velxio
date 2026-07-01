@@ -9,8 +9,12 @@ export VELXIO_REAL_SCHED=1 VELXIO_REAL_INIT=1 VELXIO_CORELOG=1
 export ESP32P4_ROM_ELF=/mnt/c/Desarrollo/velxio/third-party/esp-rom-elfs/esp32p4_rev0_rom.elf
 TMO="${1:-60}"
 SHIFT="${2:-2}"
+# Pass shift="off" to run WITHOUT -icount (wall-clock VIRTUAL_RT pacing) — needed to
+# see the real-time 1 s blink cadence; -icount slows virtual time vs wall clock.
+ICOUNT="-icount shift=${SHIFT}"
+[ "$SHIFT" = "off" ] && ICOUNT=""
 rm -f /tmp/rl_err.txt /tmp/rl_out.txt
-timeout -s KILL "$TMO" "$QEMU" -accel tcg,thread=single -smp 2 -icount "shift=${SHIFT}" \
+timeout -s KILL "$TMO" "$QEMU" -accel tcg,thread=single -smp 2 $ICOUNT \
   -M esp32p4 -kernel "$BASE/blink.ino.elf" \
   -drive file="$BASE/blink.ino.merged.bin",if=mtd,format=raw -nographic \
   >/tmp/rl_out.txt 2>/tmp/rl_err.txt

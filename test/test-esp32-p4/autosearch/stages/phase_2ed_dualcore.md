@@ -1093,6 +1093,44 @@ blink delay yields ~1 toggle per window; faster/real-time pacing shows continuou
 blink.) Remaining polish: continuous-blink stability + broaden beyond the blink
 sketch. But the hardest arc — real dual-core boot to setup()/loop() — is DONE.
 
+### Continuous-blink stability — after setup()/loop(), the boot stalls after 1 toggle
+
+The dual-core boot toggles GPIO2 once (`pin 2 -> 1`) then stalls — no second toggle,
+no crash. Both `-icount` and wall-clock (VIRTUAL_RT) pacing give the same single
+toggle, so it's NOT just slow virtual time. pcsampler at the stall:
+```
+c0 pc=0x4ff082ca (vTaskPlaceOnEventList)   c1 pc=0x4ff02622 (esp_cpu_wait_for_intr = WFI)
+schedrun=1,1   tick IRQs stopped (~29)
+```
+
+**Investigated — WFI wake (WORKED as a fix, but not the whole story):** `esp_cpu`
+did NOT override `has_work`, so it used the default RISC-V `has_work` (mip & mie). In
+CLIC mode `mie.MEIE=0`, so a pending CLIC IRQ (the tick / crosscore) would NOT wake a
+core in `esp_cpu_wait_for_intr` (WFI). Added an `esp_cpu_has_work` override that
+returns true on `cpu->irq_pending` (mirroring the S3 Xtensa `xtensa_cpu_has_work` +
+`cpu_exec_halt`, which the reference sets in `target/xtensa/cpu.c`). Correct and
+faithful, no single-core regression — but by itself it did not restore continuous
+blink.
+
+**Remaining root (next):** core 0 is stalled in **`vTaskPlaceOnEventList` inside a
+critical section** (threshold raised), so the tick is correctly masked/deferred and
+core 0 never exits the critical section to let it re-inject → the tick effectively
+stops → `delay()` never completes. Core 1 sits in WFI. This is the classic dual-core
+idle/wake + critical-section interaction: core 0 likely blocks waiting for core 1
+(the ipc/timer-service task) while holding the kernel lock, and the wake handshake to
+core 1 doesn't complete. It is the same family as the earlier `xKernelLock` work but
+now in the steady-state loop() path rather than boot. **Next:** trace why core 0
+enters `vTaskPlaceOnEventList` and what event/task it waits on, and confirm the
+crosscore wake to core 1 (now that `has_work` lets WFI wake on a pending CLIC IRQ)
+actually fires and lowers core 0's threshold. NOTE for autosearch: the `-d in_asm`
+trace overflows disk at this boot depth — use targeted host-side pcsampler/corelog
+logs, not full traces.
+
+**Status:** the landmark (real dual-core boot → setup()/loop()/GPIO2) stands; the
+`has_work` fix is a correct, S3-matched fidelity improvement; continuous-blink
+steady-state is the next refinement (an idle/wake + critical-section stall), not yet
+solved.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
