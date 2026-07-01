@@ -1221,6 +1221,18 @@ masking. My CLIC threshold gate is correct; the real bug is the flash op not
 completing, which keeps the threshold raised. The landmark
 (boot → setup()/loop()/GPIO2) is unaffected.
 
+**Refinement — it's WIDE flash-heavy execution, not a tight spin:** the 8 MB tail has
+**6431 distinct PCs** and **8 `vTaskDelay`s that DO expire**, so the tick is not fully
+dead and the task IS making (glacial) progress — it's a flash-op-dominated task
+grinding through a huge amount of `spi_flash_*` work that runs impossibly slowly
+against our flash HAL stub (or a flash status poll that only occasionally succeeds).
+So the steady-state symptom is "no 2nd blink in 90 s" = extreme slowness of the
+repeating flash path, not a hard deadlock. Next-session target: identify the task +
+the exact `spi_flash_*` op it repeats (the caller of
+`spi_flash_hal_disable_auto_suspend_mode`) and make that op complete in one shot in
+the emulation (e.g. a flash-controller "command done" status our smart-stub doesn't
+assert), so the task stops re-issuing it and the scheduler frees core 0 for the blink.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
