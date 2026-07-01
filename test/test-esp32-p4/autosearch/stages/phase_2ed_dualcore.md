@@ -1167,6 +1167,29 @@ safety re-inject when a masked tick persists across many periods (threshold wedg
 The landmark (boot → setup()/loop()/GPIO2) is unaffected; this is the steady-state
 continuous-blink refinement.
 
+### Continuous-blink — tried & DID NOT WORK (negative results, documented)
+
+- **has_work on `irq_masked_pending`** (keep core runnable while a tick is deferred):
+  no effect — core 0 is `halt=0`, so `has_work` doesn't gate its scheduling. Reverted.
+- **Bounded safety-valve re-inject** (force-deliver a tick masked for >250 periods, on
+  the theory the critical section is impossibly long): delivered MORE ticks (29→46)
+  but the blink STILL stalled after the first HIGH (no LOW). So the stall is NOT
+  merely a wedged/masked tick — force-feeding ticks does not unwedge core 0. **This is
+  the key negative result:** core 0 is genuinely frozen in `vTaskPlaceOnEventList`
+  holding `xKernelLock`, and delivering the tick ISR (which itself needs `xKernelLock`
+  / scheduler state) does not free it. Reverted (heuristic + risk of re-introducing
+  the spinlock deadlock).
+
+**Refined conclusion:** the steady-state stall is core 0 frozen (not executing) at
+`vTaskPlaceOnEventList` while holding `xKernelLock`, `halt=0`, threshold wedged — a
+single-thread round-robin scheduling pathology, not an interrupt-delivery gap. The
+next real step is to determine WHY QEMU's rr loop stops advancing a non-halted core
+0 (instruction-level: is it truly executing a tight loop, or is the rr thread parked
+because it deems all CPUs idle?). Candidate fixes then: force an rr kick / cpu_exit
+when a masked tick is pending, or investigate `cpu_exec_halt`/`tcg_kick` timing. This
+is a dedicated QEMU-internals task; the landmark (boot → setup()/loop()/GPIO2) is
+unaffected and stands.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
