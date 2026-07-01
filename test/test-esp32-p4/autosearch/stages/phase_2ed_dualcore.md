@@ -1364,6 +1364,36 @@ This is the honest end state: real dual-core ESP32-P4 boot runs the Arduino sket
 `loop()`; a visibly-continuous blink needs the idle-DFS cost addressed, which is a
 separate, well-scoped task (guest config OR a DFS-cost emulation model).
 
+### Sketch-level "disable light sleep" — makes it WORSE; the clock-SWITCH is the cost
+
+Tried the pragmatic sketch fix: rebuilt blink (arduino-cli, esp32:esp32:esp32p4
+3.3.8) with `setCpuFrequencyMhz(360)` + `esp_pm_configure(light_sleep_enable=false)`
+in `setup()`. **Result: 0 GPIO toggles (worse)** — the explicit `setCpuFrequencyMhz`
+runs the DFS clock switch synchronously in `setup()` and never reaches the first
+`digitalWrite`. So the bottleneck is the **clock-switch operation itself**, not
+"light sleep being enabled". Restored the original sketch (back to HIGH=1 known-good).
+
+**Traced the clock-switch cost** (`rtc_clk_cpll_configure`, esp32p4/rtc_clk.c):
+```c
+regi2c_ctrl_ll_cpll_calibration_start();
+while(!regi2c_ctrl_ll_cpll_calibration_is_done());   // reads HP_SYS_CLKRST_ANA_PLL_CTRL0 (0x500E60BC) bit2
+esp_rom_delay_us(10); ... + esp_rom_delay_us(SOC_DELAY_*) x several
+```
+The CPLL-calibration poll (bit 2 of 0x500E60BC) is **already stubbed** in our
+smart-stub table (`{0x500E6000,0x0BC,0x4,SMART_OR_MASK,"regi2c done (bit2)"}`), so it
+exits fast. The remaining cost is the **`esp_rom_delay_us` PLL-stabilization delays +
+the volume of clock-switch code executed per idle cycle** under slow single-thread
+TCG, with the tick masked throughout.
+
+**Definitive conclusion:** a visibly-continuous blink needs the *whole* idle
+clock-switch path to be cheap in the emulator — either intercept `esp_rom_delay_us`
+(ROM) so the fixed PLL waits are ~zero guest-time, or short-circuit
+`rtc_clk_cpu_freq_set_config` to a no-op when the target freq equals the current one
+(the idle DFS switches 360→XTAL→360, so a same-target fast path would skip most work).
+Sketch/config-level disabling is NOT viable (it triggers the same slow switch). This
+is the single, well-scoped remaining task; everything upstream (real dual-core boot,
+`setup()/loop()`, `gpio_set_level`) is confirmed working.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
