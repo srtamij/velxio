@@ -1233,6 +1233,35 @@ the exact `spi_flash_*` op it repeats (the caller of
 the emulation (e.g. a flash-controller "command done" status our smart-stub doesn't
 assert), so the task stops re-issuing it and the scheduler frees core 0 for the blink.
 
+### ✅ EXACT OP IDENTIFIED — it's idle-time DFS / light-sleep, and loop() IS running
+
+Raw tail trace (function labels) is unambiguous:
+```
+IN: gpio_set_level  ×9      IN: _Z4loopv  (loop())      IN: vTaskDelay
+IN: prvAddCurrentTaskToDelayedList  IN: vListInsert  IN: vTaskSwitchContext
+```
+plus tail histogram: **183 `rtc_clk_cpu_freq*` + 30 `esp_sleep`**. So:
+- **`loop()` and `gpio_set_level` ARE executing** — the real Arduino blink runs.
+- The "spi_flash op" is not a failing flash op; the hot functions
+  (`rtc_clk_cpu_freq_to_xtal` + `spi_flash_hal_disable_auto_suspend_mode`) are the
+  **automatic light-sleep / DFS path**: during `delay(1000)` the idle task lowers the
+  CPU clock to XTAL + reconfigures flash timing + calls `esp_sleep`, repeatedly.
+
+**Corrected root:** NOT a deadlock, NOT a frozen core, NOT a failed flash op — the
+blink is alive but progresses at a crawl because the **idle-time power-management
+(light sleep / DFS) path runs impossibly slowly / churns** in our emulation, so each
+`delay(1000)` takes an enormous amount of wall-clock (only ~1 toggle per 90 s window).
+This is the Phase 2.EB "loopTask starvation" family, now root-caused to PM/light-sleep.
+
+**Fix direction (clear + encouraging):** the emulator already runs the real
+dual-core Arduino `loop()`. To get a visible continuous blink, make the idle DFS /
+light-sleep path cheap: e.g. model the RTC clock-switch + `esp_sleep` wait as
+immediate (assert the "clock ready" / "sleep-wake" status the smart-stub leaves
+un-set so `rtc_clk_cpu_freq_to_xtal`/`esp_sleep` return in one shot), or disable
+automatic light sleep for the emulation. Either removes the idle churn so `delay()`
+elapses at a usable rate. The landmark (real dual-core boot running `setup()/loop()`)
+is not just intact — it is CONFIRMED executing the sketch loop.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
