@@ -1131,6 +1131,42 @@ logs, not full traces.
 steady-state is the next refinement (an idle/wake + critical-section stall), not yet
 solved.
 
+### Continuous-blink stall — PRECISE state (pcsampler + threshold/irq/halt/lock)
+
+Instrumented the pcsampler with per-core CLIC threshold, IRQ latch, halted flag,
+mstatus, and `xKernelLock`. At the stall (identical across 400 samples / ~12 s):
+```
+c0 pc=0x4ff082ca (vTaskPlaceOnEventList)  thr=0x7f lvl=3  pend=0 masked=1  halt=0  mstatus=0x1880 (MIE=1)
+c1 pc=0x4ff02622 (esp_cpu_wait_for_intr)  thr=0x1f lvl=0  pend=0 masked=0  halt=1  (WFI)
+xKernelLock owner=0x0000cdcd (=CORE 0)  count=1
+```
+Findings:
+- **core 0 HOLDS `xKernelLock` (count=1)** — it is NOT waiting on core 1 (no ABBA);
+  core 1 owns nothing and is idle in WFI.
+- core 0 is in `vTaskPlaceOnEventList` (which acquires `xKernelLock` at +0x38 and
+  releases it via `vPortExitCriticalMultiCore` at the tail). It already holds the
+  lock, so it's PAST the acquire (env->pc `0x4ff082ca` is a stale TB-entry value).
+- core 0's **threshold is stuck at level 3** (critical section) and the tick is
+  **deferred/masked (`masked=1`, `pend=0`, MEIP not raised)** — so it can't preempt,
+  and it only re-injects when core 0 *lowers* the threshold (on
+  `vPortExitCriticalMultiCore`). core 0 never gets there → the tick is wedged.
+- core 0 `halt=0` yet its PC never advances in 12 s → QEMU's single-thread
+  round-robin is **not executing core 0** even though it isn't halted.
+
+**Leading hypothesis:** the deferred-tick (masked, no MEIP) makes core 0's
+`has_work` return false; with core 1 halted (WFI), QEMU's rr loop finds no runnable
+work and sleeps until the next timer — but every tick that fires is re-deferred
+(threshold still 3), so core 0 is never advanced to release the lock / lower the
+threshold. A CLIC-threshold-masking × round-robin-idle wedge that doesn't happen on
+real parallel silicon. **Next:** (a) targeted instruction trace of core 0 in the
+stall (tiny `-d in_asm` buffer, not full) to confirm executing-vs-idle; (b) try
+keeping `parent_irq` asserted for a deferred tick so QEMU keeps core 0 runnable, with
+a re-defer at the exec_interrupt boundary that does NOT mutate irq_pending (the
+earlier regression was from lowering parent_irq mid-delivery); or (c) a bounded
+safety re-inject when a masked tick persists across many periods (threshold wedged).
+The landmark (boot → setup()/loop()/GPIO2) is unaffected; this is the steady-state
+continuous-blink refinement.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
