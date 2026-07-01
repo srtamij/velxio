@@ -946,6 +946,35 @@ root fixes (SYSTIMER INT_CLR ack + mintstatus.mil), no regressions**; the boot n
 panics-and-core-dumps instead of silently storming — the primary panic is the next
 precise target.
 
+### 🎯 PRIMARY PANIC unmasked — `spinlock_acquire(NULL)`
+
+Traced under the core-dump secondary abort to the primary panic. The tick ISR
+(cause=17) keeps interrupting the SAME two task-context PCs: `0x4ff06ae8` (inside
+`xPortEnterCriticalTimeout`) and `0x4ff0ce9a` (`__assert_func`). So the main task is
+stuck in `__assert_func` — an assertion already fired. Resolving the assert's
+string args (from the ELF `.flash.rodata`):
+```
+file = spinlock.h   line = 84   func = spinlock_acquire   expr = "lock"
+```
+i.e. **`assert(lock)` in `spinlock_acquire` — the portMUX pointer is NULL**. A
+critical section is entered with a NULL spinlock. Sequence: assert fires →
+`__assert_func` runs (slow, logging) → the tick keeps interrupting it → the
+panic/core-dump path logs from the ISR → the SECONDARY `lock_acquire_generic` abort
+(now understood). Console confirms: partition errors → panic → "Panic handler
+entered multiple times. Abort panic handling. Rebooting…".
+
+**Candidate roots for the NULL mux:** (a) a heap-allocated spinlock/queue that came
+back NULL because the REAL_INIT heap isn't fully functional (the Phase 2.EC
+`heap_caps` theme — allocations returning NULL leave objects with NULL sync
+primitives, cf. the Phase 2.EA "NULL-queue task"); or (b) a subsystem whose init was
+skipped/failed (e.g. downstream of `load_partitions` returning 0x105), leaving its
+lock uninitialized. **Next:** capture the caller of the NULL `spinlock_acquire`
+(the RA at `0x4ff06ae8` — add a host-side log in `esp_cpu_exec_interrupt` when
+`mepc==0x4ff06ae8` printing the interrupted `ra`), which names the exact subsystem;
+then either fix its init or the heap. This is the precise primary blocker now that
+the SYSTIMER-storm and mintstatus root fixes are in and the core-dump secondary is
+understood.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
