@@ -1037,6 +1037,35 @@ through the Arduino init. Remaining gap: `initArduino → setup()/loop()/GPIO2` 
 the 15 s emulated-time window is too short for the long init, or one more slow flash
 op / blocker inside initArduino). That is the next step.
 
+### Next blocker (post-deadlock) — `load_partitions` via `spi_flash_mmap` ("No MD5")
+
+With the deadlock fixed, a 90 s window shows the dual-core boot no longer crashes but
+**loops inside `initArduino` retrying `load_partitions`**, which fails:
+```
+E (…) partition: No MD5 found in partition table
+E (…) partition: load_partitions returned 0x105  (ESP_ERR_NOT_FOUND)
+```
+The partition table IS valid in `merged.bin` @0x8000 (magic `0xAA50` entries
+nvs/otadata/app0/app1/spiffs/coredump, MD5 marker `0xEBEB` @0x80C0 + hash @0x80D0).
+`load_partitions` (esp_partition/partition.c:73) reads it via **`spi_flash_mmap`**,
+computes MD5, and compares — but the mapped read returns wrong data, so "No MD5".
+
+Our flash-MMU eager-translate hooks the correct P4 registers
+(`SPI_MEM_C_MMU_ITEM_INDEX_REG`=0x5008C380 / `..._CONTENT_REG`=0x5008C37C, confirmed
+against `mmu_ll_write_entry`), yet **0 eager-translate events fire** for the
+partition mapping — so the app-time `spi_flash_mmap` MMU write for flash page 0 isn't
+being captured/served, and the guest reads garbage at the mapped vaddr. This is the
+Phase 2.T `spi_flash_mmap` territory resurfacing now that the boot gets far enough to
+exercise it in the app. **Next:** confirm whether `spi_flash_mmap`/`mmu_ll_write_entry`
+run at all in the app context (the `-d in_asm` trace overflows disk at this boot
+depth — use a targeted host-side MMU-write log instead), then make the eager-translate
+serve the app-time page-0 mapping so the partition-table read returns the real bytes.
+
+**Session headline:** the dual-core deadlock — the single hardest architectural
+blocker — is FIXED; the real ESP32-P4 dual-core boot now runs cleanly into
+`initArduino`. The remaining gap to `setup()/loop()` is the `spi_flash_mmap`
+partition-table read, a well-scoped flash-MMU fidelity task.
+
 ## Risks / notes
 
 - SMP + a custom CPU subclass in TCG is the highest-risk change in this project;
