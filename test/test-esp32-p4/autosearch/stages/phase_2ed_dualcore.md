@@ -1405,3 +1405,347 @@ is the single, well-scoped remaining task; everything upstream (real dual-core b
 - Core 1 booting through the real ROM is the most faithful; fallback is to set
   core 1's PC directly to the stored appcpu boot addr if the ROM app-cpu path
   doesn't run cleanly.
+
+---
+
+# Phase 2.EE — the tick was delivered to the WRONG CLIC line (crosscore, not tick)
+
+## Root cause (the real reason the blink never advanced)
+
+The earlier "continuous blink" hunt (2.ED) chased the FreeRTOS tick *catch-up*
+register model (TARGETn_CONF / INT_ST). That was a red herring. Instrumenting the
+actual delivery proved the tick ISR **never ran at all**: `INT_ST` (0x70) was read
+**0 times** across the whole boot, yet the systimer fired 33 IRQs into the CPU.
+
+Resolving the delivered IRQ showed all 33 had **`cause=17` → `_interrupt_handler`
+(0x4ff00268)** — the shared IDF CLIC entry stub — but `SysTickIsrHandler`
+(0x4ff07298) was never reached.
+
+The interrupt-matrix log was decisive:
+```
+[esp32p4.intmtx0] MAP src 53 -> intr 18 (cpu line 18)   # SYSTIMER_TARGET0 (OS tick)
+[esp32p4.intmtx0] MAP src 79 -> intr 17 (cpu line 17)   # FROM_CPU_0 (crosscore IPC)
+```
+IDF's `esp_intr_alloc` routes the OS-tick source (53) to **CPU line 18** and the
+crosscore FROM_CPU_0 source to **line 17**. But the machine **hard-wired**
+`systimer.irq_target0 → CPU line 17` (a Phase 2.S choice). So every tick was
+delivered as `cause=17` and dispatched by `_global_interrupt_handler`
+(`intr_get_item(mcause-16)`) to **`esp_crosscore_isr`**, never to
+`SysTickIsrHandler`. `xTaskIncrementTick` never ran → `xTickCount` frozen →
+`delay(500)` blocked forever (blink = one HIGH, then hang). This was masquerading
+as a "slow/masked tick" for many phases.
+
+## The fix (silicon-accurate)
+
+Route the systimer TARGET0 output **through core 0's interrupt matrix** so it
+raises whatever CPU line `MAP[53]` was programmed to (line 18), exactly like real
+hardware — instead of a hard-wired line. Implemented in `hw/riscv/esp32p4.c`:
+- `esp32p4_systimer_irq_route()` — new qemu_irq handler; in `VELXIO_REAL_SCHED` it
+  raises `esp32p4_intmtx_line(intmtx0, SRC_SYSTIMER_T0)`, else the legacy line 17
+  (demo byte-identical).
+- `g_esp32p4_intmtx0` captured at `esp32p4_install_intmtx`.
+- systimer wired to `qemu_allocate_irq(esp32p4_systimer_irq_route,...)` instead of
+  the direct `qdev_get_gpio_in_named(...,17)`.
+- `esp32p4_systimer.c`: gate the tick assertion on `int_ena bit0` in real_sched so
+  we never raise the routed line before `MAP[53]` is programmed (default clamp
+  would deliver to line 16 / unhandled slot).
+
+**Result (VERIFIED):** ticks now deliver as `cause=18` (27 in the window) and
+`SysTickIsrHandler` runs (`INT_ST` read 26×). The tick reaches the correct handler
+— the 5-phase blocker is broken.
+
+## Clock-rate finding (VIRTUAL_RT is fine)
+
+The 2.ED "VIRTUAL_RT advances only ~32 ms in 20 s" claim was a **measurement
+artifact**: the INT_ST debug log is capped at 30 early-boot reads. An uncapped
+rate probe (`[systimer.rate]`, VIRTUAL_RT vs REALTIME) proved VIRTUAL_RT tracks
+wall-clock **1:1** (~220 ms per 200 ticks, matching REALTIME). The tick timer
+fires ~1 kHz in wall time; no clock change is needed. (A `QEMU_CLOCK_REALTIME`
+experiment was tried and **reverted** — its huge absolute counter value regressed
+early boot to `schedrun=0`, core 1 stuck in ROM systimer code.)
+
+## NEXT blocker (newly exposed, deeper) — FreeRTOS-SMP spinlock CAS deadlock
+
+With the tick delivered and the scheduler now actually running, the blink reaches
+`loop()` → `digitalWrite(HIGH)` (pin 2 -> 1 ✓) → `Serial.println("HIGH")` and hangs:
+- **core 0** spins in `vTaskPlaceOnEventList` (0x4ff082ca, 373/394 samples) — a
+  `spinlock_acquire` on `xKernelLock`.
+- **core 1** idle in `esp_cpu_wait_for_intr` (0x4ff02608) — NOT holding the lock.
+- `xKernelLock` owner = **`0xb33fffff` = SPINLOCK_FREE**, yet core 0 can't take it.
+- an assert fires in `vPortExitCriticalMultiCore`: `configASSERT(nesting > 0)` —
+  an **unbalanced critical-section exit** (`port_uxCriticalNesting[core]==0`).
+
+The CAS is `rv_utils_compare_and_set` = an `lr.w`/`sc.w` loop
+(`cas: lr.w; bne fail; sc.w; bnez cas`). A FREE lock that never gets taken means
+**`sc.w` is failing every iteration** (store-conditional reservation lost) under
+`-accel tcg,thread=single -smp 2`. The lock lives in L2MEM which IS plain RAM
+(`memory_region_init_ram`, so reservations are valid) — so the reservation is being
+cleared by something (round-robin core switch / interrupt entry / same-address
+tracking), not by a non-RAM target. This — plus the `port_uxCriticalNesting`
+imbalance — is the true final blocker and the subject of Phase 2.EF.
+
+---
+
+# Phase 2.EF — CLIC delivery-time masking fix (applied) + newly-exposed tick-ISR nesting panic
+
+## What was applied (workflow-synthesized, source-verified)
+
+5-agent workflow root-caused the spinlock deadlock: the CLIC threshold was only
+enforced at IRQ **arrival** (`esp_cpu_irq_handler`), never at **delivery**
+(`esp_cpu_exec_interrupt`). An IRQ latched into `irq_pending` BEFORE a critical
+section raised the threshold was still delivered inside it → `riscv_cpu_do_interrupt`
+clears `env->load_res` (cpu_helper.c:691) → the spinlock CAS `lr.w/sc.w` (split
+across the `bne` TB boundary) fails forever on the FREE `xKernelLock`.
+
+**Fix (esp_cpu.c, `esp_cpu_exec_interrupt`, gated on VELXIO_REAL_INIT):** re-defer at
+the delivery choke point —
+```c
+if (cpu->irq_pending && esp_cpu_clic_thresh_gate_enabled() &&
+    ((cpu->clic_thresh >> 5) & 0x7u) >= 1u) {
+    cpu->irq_masked_pending = true; cpu->masked_cause = cpu->irq_cause;
+    cpu->irq_pending = false; qemu_irq_lower(cpu->parent_irq); return false;
+}
+```
+This matches CLIC/mintthresh silicon (a masked interrupt is never *taken*) and the S3
+Xtensa reference (masked interrupts stay latched, exclusive monitor never cleared on
+trap). `esp_cpu_set_clic_thresh` re-injects on threshold-drop; `esp_cpu_has_work`
+ignores `irq_masked_pending` so WFI still sleeps.
+
+## Result — the spinlock deadlock IS resolved, next bug exposed
+
+The masking fix WORKED for symptom A: tick deliveries dropped 27→4 (ticks now deferred
+during critical sections), and core 0 **no longer spins on the FREE xKernelLock** —
+it gets PAST `vTaskPlaceOnEventList`. Demo path re-verified clean (no regression).
+
+But the boot now **panics + reboot-loops** after the first `pin 2 -> 1`:
+```
+Guru Meditation Error: Core 0 panic'ed (Store access fault)   # secondary: core-dump re-entry
+```
+The **primary** panic (from the `[assertcaller]` stacks) is `configASSERT(nesting>0)`
+in `vPortExitCriticalMultiCore`, reached via
+`SysTickIsrHandler → xPortSysTickHandler → xTaskIncrementTick → prvEXIT_CRITICAL`.
+`xTaskIncrementTick` brackets its work with `prvENTER/EXIT_CRITICAL_SAFE_SMP_ONLY`
+(balanced), so `port_uxCriticalNesting[0]` should be ≥1 at exit but is 0.
+
+**Key evidence — the tick ISR ran on the WRONG stack:** the asserting frame has
+`sp=0x4ff7fdc0` (a task stack) while `xIsrStackTop[0]=0x4ff13230`. So
+`rtos_int_enter` did NOT switch to the ISR stack — which it only does when
+`schedrun!=0 && port_uxInterruptNesting==0` (first-level ISR). The tick was therefore
+delivered as a **nested** interrupt (interrupt-nesting already >0), on the task stack,
+and its `xTaskIncrementTick` critical enter/exit desynced `port_uxCriticalNesting`.
+
+This is a distinct, pre-existing emulator bug (interrupt-nesting / ISR-stack-switch),
+unreachable until 2.EF got past the spinlock. It is the Phase 2.EG target: why is the
+SYSTIMER tick delivered while `port_uxInterruptNesting[core0] > 0` (nested), i.e. is an
+outer ISR still "active" in the CLIC/mintstatus model when the tick traps, or does
+`rtos_int_enter` mis-read nesting? Cross-check `mintstatus.mil` / `intr_level`
+decrement-on-mret vs `port_uxInterruptNesting`, and the level-triggered tick
+re-assertion during ISR exit.
+
+---
+
+# Phase 2.EG — nested-ISR delivery guard (removes panic) + residual blocker isolated
+
+## Applied (kept — silicon-motivated, gated on VELXIO_REAL_INIT, no demo regression)
+
+1. **Delivery-time threshold masking (2.EF)** in `esp_cpu_exec_interrupt`: re-defer a
+   pending IRQ when the CLIC threshold level >= 1 (critical section). Resolves the
+   "interrupt delivered inside a critical section clears load_res / preempts it".
+2. **Nested-ISR guard (2.EG)**: also defer when `intr_level > 0` (already inside an
+   ISR == mintstatus.mil>0), and **re-inject on `mret`** (esp_cpu_handle_mret) when
+   `intr_level` returns to 0 and the threshold is clear. Models CLIC "current level
+   masks same/lower interrupts until mret". This **removed the reboot-loop panic**:
+   without it the level-triggered 1 kHz tick was delivered a SECOND time while
+   SysTickIsrHandler was still running (slow TCG), landing on the TASK stack
+   (rtos_int_enter only switches to xIsrStackTop for a first-level ISR), whose
+   xTaskIncrementTick desynced port_uxCriticalNesting -> configASSERT(nesting>0).
+   Verified `intr_level` stays healthy (=1, no drift; the mret re-inject keeps it
+   balanced).
+
+## Tried + REVERTED (documented negative results)
+
+- **QEMU_CLOCK_REALTIME systimer counter** — regressed early boot (huge absolute
+  counter value -> schedrun stuck 0, core 1 wedged in ROM systimer). VIRTUAL_RT was
+  proven to track wall-clock 1:1 (the "32 ms/20 s" was a capped-log artifact), so no
+  clock change is needed. Reverted to VIRTUAL_RT.
+- **Preserve `env->load_res` across trap entry** (cpu_helper.c, REAL_INIT-gated,
+  workflow's belt-and-suspenders) — did NOT change the stall (core 0 stuck at the
+  exact same PC 0x4ff082ca). This DISPROVES the "sc.w fails because a trap clears the
+  reservation" theory for the residual stall. Reverted.
+
+## Residual blocker (Phase 2.EH target) — cross-core event-list wait, NOT the CAS
+
+After all the above, the deterministic (`-icount shift=2`) real boot: 27 tick IRQs
+delivered to SysTickIsrHandler, NO panic, 1 `pin 2 -> 1`, then core 0 pegs at
+`vTaskPlaceOnEventList+0x?? = 0x4ff082ca/0x4ff082d6` (a tight 2-instruction loop).
+`vTaskPlaceOnEventList` takes xKernelLock then calls `vListInsert()` (walks the event
+list by priority) + `prvAddCurrentTaskToDelayedList()`. The 2-insn loop matches
+**`vListInsert`'s insertion-point search** — i.e. the event/delayed list is likely
+**circular/corrupted** (a bad `pxNext`), so the search never terminates. This is a
+data-structure corruption from an earlier SMP race (list mutated without/with wrong
+lock, or a half-completed critical section), NOT an lr.w/sc.w or interrupt-delivery
+bug. Behaviour is **non-deterministic under wall-clock** (VIRTUAL_RT) timing — some
+runs spin here, previously some panicked — characteristic of a genuine SMP ordering
+race under single-thread round-robin TCG. Next: dump the event/delayed List_t at the
+stall (uxNumberOfItems vs the ring) to confirm the corruption, and trace which core
+mutated it last vs which held xKernelLock.
+
+## Status summary (end of this arc)
+
+WORKS (verified, no single-core/demo regression): real dual-core boot ->
+setup()/loop() -> `SysTickIsrHandler` runs (tick routed to the correct CLIC line 18)
+-> `digitalWrite(HIGH)` toggles GPIO2 once; no panic. BLOCKED: the 2nd delay()/list
+operation wedges in vListInsert (corrupted event list). The headline fix this arc was
+**2.EE** (tick was delivered to the crosscore line 17 instead of the OS-tick line 18
+for many phases — the real reason xTickCount never advanced).
+
+---
+
+# Phase 2.EH — CORRECTION: the stall is a NULL pxEventList, NOT a corrupted list
+
+A 5-agent workflow + machine-checked disassembly OVERTURNED the "vListInsert corrupted
+event-list" hypothesis from the previous section. Ground truth (verified):
+
+- `0x4ff082ca` is the **`vTaskPlaceOnEventList` PROLOGUE** (`addi sp,sp,-16`); `0x4ff082d4`
+  is `bnez a0, 0x4ff082f8`; `0x4ff082d6` (`lui a3,0x40036`, the `configASSERT(pxEventList)`
+  fail-arg setup) is reachable **ONLY when `a0==0`**. `vListInsert` is a DIFFERENT address
+  (0x4ff07370, search loop 0x4ff07394-9a) and is NOT where the sampler pegs — there is no
+  backward branch in 0x4ff082ca..d6, so the "2-instruction loop" was a misread prologue.
+- **CONFIRMED empirically** with a PC-sampler probe (dumps core-0 a0/ra/sp+stack at the
+  peg): `a0 (pxEventList) = 0x00000000`. So the wedge is the `configASSERT(pxEventList)`
+  NULL-fail path, re-driven by the 1 kHz tick before `__assert_func` finishes printing —
+  which is why it LOOKS like a silent peg with no panic.
+- xKernelLock reads FREE because the assert fires BEFORE `xPortEnterCriticalTimeout`, so
+  the task never takes the lock (this was mis-read as an SMP lock race).
+- The interrupt frame on the ISR stack (sp≈0x4ff13210, xIsrStackTop[0]=0x4ff13230) shows
+  the interrupted task PC = vTaskPlaceOnEventList and return into `rtos_int_exit` — i.e.
+  crosscore(cause17)/tick ISRs merely PREEMPT a TASK that is calling vTaskPlaceOnEventList
+  with a NULL event list. `ra=0x4ff082ca` is a PIC `jal .+4` artifact, not the caller.
+
+ROOT CAUSE: a queue/semaphore/ringbuffer **handle is NULL** because its subsystem init did
+not run under VELXIO_REAL_INIT — the blink hits it at `Serial.println("HIGH")` (the first
+call after the confirmed `pin 2 -> 1`). This is the SAME failure class as Phase 2.EA's
+"NULL-queue task" (#195), one subsystem later. It is a GUEST-INIT gap, NOT an emulator SMP
+/ lr-sc / interrupt-delivery bug (all three SMP fix theories were refuted: mhartid is
+already per-core 0/1; the CLIC threshold is already per-core; a torn list can't null an
+argument).
+
+THE FIX (Phase 2.EC/#197): complete `do_system_init` under VELXIO_REAL_INIT so the
+subsystem behind that blocking call (very likely the Serial/UART/USB-CDC driver's TX
+queue/semaphore, created by uart_driver_install / the HWCDC begin path) gets a valid
+handle instead of NULL. This is substantial and has its own known blocker (code comments:
+"real do_system_init faults cause 5 / load access fault at app 0x4000a214"). Gated on
+VELXIO_REAL_INIT so demo/single-core stay byte-identical.
+
+DECISIVE VALIDATION recommended first: build a blink WITHOUT Serial.println. If it blinks
+continuously (pin 2 HIGH>1 AND LOW>1), it PROVES the tick(2.EE)/CLIC-masking(2.EF/EG)/
+scheduler/delay/GPIO stack is fully correct and the ONLY remaining blocker is the Serial
+driver's NULL handle — isolating Phase 2.EC to exactly one subsystem.
+
+STILL-VERIFIED WORKING (no regression): real dual-core boot -> setup()/loop() ->
+SysTickIsrHandler runs (tick on correct CLIC line 18) -> digitalWrite(HIGH) toggles GPIO2;
+no panic. The headline fix this whole arc remains 2.EE (tick was going to the crosscore
+line 17, never the OS-tick line 18).
+
+## Phase 2.EH — no-Serial validation was CONFOUNDED (but confirms the init thesis)
+
+Built + ran a Serial-free blink (`sketches/blink_noserial`, esp32:esp32:esp32p4, real
+dual-core). Result: it does NOT blink — it aborts EARLIER than the Serial blink:
+`abort() at PC 0x40007317 on core 0`, **schedrun=0,0** (scheduler never starts), core 0
+pegged at 0x4ff04ba0, 0 ticks. So the emulator's boot is tuned to the exact `blink.ino`
+binary (address-specific patches / app-code offsets), and a DIFFERENT app binary hits a
+different early-init abort. The no-Serial test therefore can't cleanly isolate the Serial
+driver — but it REINFORCES the thesis: BOTH sketches fail on incomplete real init under
+VELXIO_REAL_INIT (Serial blink: NULL queue handle at loop's Serial.println; no-Serial:
+abort in early app init before the scheduler). The gating work for a fully-working
+arbitrary sketch is **Phase 2.EC/#197 — complete `do_system_init` + the driver inits** so
+handles are valid and app init doesn't abort. The tick(2.EE)/CLIC(2.EF-EG) fixes are
+necessary and correct but not sufficient alone; real-init completeness is the next
+foundation. (Emulator tuning being binary-specific is itself a limitation to remove in
+2.EC — the goal is any-sketch boot, not just the one blink.)
+
+---
+
+# Phase 2.EI + 2.EC-fix — 🎉 CONTINUOUS BLINK ACHIEVED (real dual-core firmware, wall-clock cadence)
+
+## Final result (VERIFIED, 3/3 deterministic + wall-clock)
+
+- `-icount shift=2`, 25 s: **HIGH=25 LOW=25, 0 panics — three runs out of three, identical.**
+- Wall-clock (no icount), 30 s: **30 HIGH + 30 LOW, perfectly alternating = the sketch's
+  exact 500 ms + 500 ms cadence at REAL wall-clock time.**
+- Demo/single-core path: byte-identical (all fixes gated on VELXIO_REAL_SCHED/REAL_INIT).
+- The REAL, unmodified ESP-IDF + Arduino dual-core blink firmware now boots and runs
+  `loop()` continuously on the emulated ESP32-P4. This closes the multi-phase
+  "continuous blink" arc (2.DZ → 2.EI).
+
+## The forensic chain that got here (each step machine-verified)
+
+1. **[vTPOEL] probe with task name (TCB+52)**: the "NULL pxEventList caller" was
+   **loopTask itself**, running with **sp on the ISR stack** — impossible for a normal
+   blocking call. That killed the "Serial's NULL queue handle" theory.
+2. **[vTPOEL-entry] IRQ-entry probe**: ZERO interrupt deliveries ever had mepc in
+   the vTaskPlaceOnEventList entry region → the CPU arrives there by fall-through,
+   not by interrupt resume.
+3. **Saved-ra forensics**: the frame's saved ra = 0x4ff082ca (the function's OWN
+   entry). resolve: the call site 0x4ff082c6 is the LAST instruction of
+   **`vTaskSwitchContext`** (0x4ff0809c) — a noreturn `jal __assert_func` whose
+   return address = the next function. **`__assert_func` is the 2.K silent-`ret 0`
+   patch** → it RETURNS with a0=0 → control FALLS INTO vTaskPlaceOnEventList's
+   prologue → `bnez a0` (a0=0) → the 2.DZ NULL-guard epilogue pops the ra the
+   prologue just pushed (0x4ff082ca) → `ret` jumps BACK to the prologue →
+   **self-sustaining prologue→epilogue→ret loop**, silent forever. Every observed
+   anomaly (a0=0 = the stub's return value; ISR sp = vTaskSwitchContext runs in
+   rtos_int_exit; no assert print) is explained.
+4. **Which assert?** `configASSERT( xTaskScheduled == pdTRUE )` in
+   `prvSelectHighestPriorityTaskSMP` — after loopTask's first `delay(500)` removed
+   it from ready, **core 0 had NO runnable task, not even IDLE0**.
+5. **[sched] one-shot dump** (idle handles + ready-list walk):
+   `xIdleTaskHandle[0] == xIdleTaskHandle[1] == 0x4ff60000 "IDLE1"` (pinned core 1!),
+   ready[0] contained only that task (already running on core 1). **IDLE0's TCB had
+   been OVERWRITTEN by IDLE1's.**
+6. **Root cause**: the Phase 2.L `vApplicationGetIdleTaskMemory` static-buffer stub
+   hands out the FIXED buffer 0x4FF60000 (TCB) + 0x4FF60400 (stack) — but
+   `prvCreateIdleTasks` calls it **once per core**. Second call overwrote the first.
+   A single-core-era patch that silently corrupts dual-core.
+
+## THE FIX (2 changes, both gated)
+
+1. **(2.EC) un-skip the vApplicationGetIdleTaskMemory stub under VELXIO_REAL_INIT**
+   (patch addresses 0x4FF07042..0x4FF0705A added to the REAL_INIT skip list in
+   esp32p4.c): the ORIGINAL function body pvPortMalloc's the TCB+stack per call, and
+   pvPortMalloc is served by the 2.L bump allocator which DOES advance its offset —
+   so each core's idle task gets DISTINCT memory, as on real silicon.
+2. **(2.EI) deferred-cause BITMAP** in esp_cpu.c/.h (`uint64_t irq_deferred` replaces
+   the single `masked_cause` slot): tick (18) + crosscore (17) deferred in the same
+   masked window no longer overwrite each other; ALSO defer-not-drop when
+   mstatus.MIE is off (the crosscore FROM_CPU pulse is one-shot — the old
+   accept-or-drop lost it for good). `esp_cpu_reinject_deferred()` replays one cause
+   per unmask edge (threshold-drop + mret). Models the real CLIC's per-line
+   clicintip pending. This removed the non-deterministic "1 tick then wedged in
+   enter/exit-critical" run variant and made all runs converge.
+
+## Investigated / did NOT work / notes (for the record)
+
+- "Corrupted vListInsert ring" (2.EH first hypothesis) — WRONG, disproven by disasm.
+- "Serial's NULL queue handle starves loopTask" — WRONG (the NULL a0 was the silenced
+  assert's return value, not a handle).
+- load_res preservation across traps — no effect, reverted (2.EG).
+- QEMU_CLOCK_REALTIME systimer — regressed boot, reverted; VIRTUAL_RT is 1:1 with
+  wall clock (proven by rate probe).
+- The diagnostic probes ([vTPOEL], [vTPOEL-entry], [sched] dump) are kept,
+  CORELOG-gated — they cost nothing in normal runs and instantly diagnose the next
+  NULL-handle/assert-loop class bug.
+- The 2.K silent-`__assert_func` patch remains a foot-gun (it converts every failed
+  assert into silent state corruption / fall-through loops — this cost us MULTIPLE
+  phases). Follow-up: make it LOG the assert (file/line in a2/a3) before returning,
+  emulator-side, so the next silenced assert is visible immediately.
+
+## Remaining follow-ups (next phases)
+
+- **Serial console output**: pin 2 toggles but the HIGH/LOW println strings don't
+  reach the console yet — trace the HWCDC/UART TX path (likely the USB-Serial-JTAG
+  TX FIFO drain or uart driver install under REAL_INIT).
+- Real heap (drop the bump allocator entirely) once do_system_init's heap_caps_init
+  is verified against the real ROM layout — the threshold to ANY-sketch support.
+- Per-core CLIC storage[] split; assert-logging stub; wall-clock non-determinism of
+  boot (VIRTUAL_RT tick during boot) if reproducibility matters.
