@@ -1749,3 +1749,56 @@ foundation. (Emulator tuning being binary-specific is itself a limitation to rem
   is verified against the real ROM layout — the threshold to ANY-sketch support.
 - Per-core CLIC storage[] split; assert-logging stub; wall-clock non-determinism of
   boot (VIRTUAL_RT tick during boot) if reproducibility matters.
+
+---
+
+# Phase 2.EJ — 🎉 SERIAL CONSOLE OUTPUT WORKING (the complete blink sketch now runs 100%)
+
+## Final result (VERIFIED)
+
+Wall-clock 40 s run, console stdout:
+```
+ESP32-P4 blink starting
+HIGH
+LOW
+HIGH
+LOW
+... (40 HIGH + 40 LOW, perfectly alternating, matching the 40+40 GPIO toggles)
+```
+The COMPLETE unmodified Arduino blink sketch — `Serial.begin` + banner in setup(),
+`digitalWrite` + `Serial.println` + `delay(500)` in loop() — now executes end-to-end
+on the emulated dual-core ESP32-P4 at real wall-clock cadence. Demo path unchanged.
+
+## The forensic chain (each step machine-verified)
+
+1. `[uart.tx]` device probe: ZERO bytes ever reached the UART0 FIFO → driver never
+   wrote. `[serial0]` object dump: vptr valid (0x40039c10, ctors ran) and — after
+   correcting the field layout (Stream::_timeout=1000 at +8) — **`_uart=0x4ff0f794`
+   NOT null**: Serial.begin() had SUCCEEDED (first hypothesis "uartBegin failed" was
+   WRONG; documented for the record).
+2. `-d in_asm` filtered call-sequence trace: `uartBegin`'s FULL happy path executes
+   (driver_install → param_config → clk_tree → hal_init → ... → uartSetRxFIFOFull),
+   then `Print::println(const char*) → Print::write(const char*)` — but
+   **`HardwareSerial::write(buf,len)` NEVER appears**.
+3. vtable dump (ELF + RUNTIME, byte-identical): `vtbl[3] = 0x400001e8 =
+   HardwareSerial::write(EPKhj)` — the vtable is CORRECT.
+4. Raw TB disassembly of `Print::write(const char*)` at runtime:
+   `lw a5,0(s0)` (vptr loaded) then **`mv a0,zero; ret`** — NOT gcc output.
+   It was the **Phase 2.T-fix stop-gap patch** at 0x4000079A/0x4000079E
+   (`c.li a0,0; c.ret` replacing `lw a5,12(a5); jr a5`), added when the init
+   bypass skipped the C++ ctors and the NULL vptr made the dispatch load-fault.
+   Under REAL_INIT the real ctor pass runs and the vtable is valid — the stop-gap
+   itself was the only thing muting Serial.
+
+## THE FIX
+
+Add 0x4000079A/0x4000079E to the REAL_INIT patch-skip list (like the idle-task and
+do_system_init un-skips): the ORIGINAL virtual dispatch executes →
+HardwareSerial::write → uartWrite → uart_write_bytes → UART0 FIFO → console chardev.
+One more entry in the "stale single-core stop-gap breaks the real boot" pattern
+(2.L idle buffer, 2.K silent assert, now 2.T Print::write) — the running theme of
+this arc: as REAL_INIT matures, the remaining work is largely REMOVING old stop-gaps.
+
+## Status: the blink milestone is now COMPLETE (GPIO + Serial). Next frontier:
+real heap (drop the bump allocator) → ANY-sketch support (2.EC full); assert-logging
+stub; per-core CLIC storage split.
