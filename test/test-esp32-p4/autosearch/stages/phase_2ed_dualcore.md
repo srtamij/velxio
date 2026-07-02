@@ -1802,3 +1802,48 @@ this arc: as REAL_INIT matures, the remaining work is largely REMOVING old stop-
 ## Status: the blink milestone is now COMPLETE (GPIO + Serial). Next frontier:
 real heap (drop the bump allocator) → ANY-sketch support (2.EC full); assert-logging
 stub; per-core CLIC storage split.
+
+---
+
+# Phase 2.EK — 🎉 REAL HEAP ENABLED (bump allocator retired under REAL_INIT)
+
+## Result (VERIFIED, first try)
+
+With the genuine `heap_caps_init` heap (initialized by the un-skipped
+do_system_init against the real ROM memory-layout table) now serving ALL
+allocations under VELXIO_REAL_INIT:
+- 3/3 deterministic trials: HIGH=25/LOW=25, 0 panics — identical to the bump-era
+  behaviour.
+- Serial output intact (banner + alternating HIGH/LOW at wall-clock cadence).
+- Demo/single-core byte-identical (bump remains for legacy REAL_SCHED-only mode).
+- **Proof the real heap is live**: task TCBs moved from the fixed bump pool
+  (TCB=0x4ff65c60, idle=0x4ff60000) to multi_heap-managed addresses just past
+  .bss (TCB[0,1]=0x4ff1819c/0x4ff18754, others at 0x4ff15c48/0x4ff16200/0x4ff3d720)
+  — distinct, properly managed blocks with WORKING free().
+
+## What was removed (one coherent set — mixing allocators would corrupt)
+
+1. Patch-table skip range 0x4FF06FF6..0x4FF07034 under REAL_INIT: the 2.L
+   `pvPortMalloc -> c.j bump` redirect, the `xPortCheckValidListMem -> li a0,1;ret`
+   stub (also reused by xPortCheckValidTCBMem via its `j`), and the 12 bump_alloc
+   instructions that overwrote that function's body. Originals restored -> real
+   pointer validation + real pvPortMalloc -> heap_caps_malloc -> multi_heap.
+2. The 2.DW direct writes (heap_caps_malloc @0x4FF01024 -> jal bump;
+   heap_caps_free @0x4FF011E4 -> ret noop) wrapped in `if (!esp32p4_real_init)`.
+
+This closes the 2.L-era "no heap" workaround chain entirely for the real boot:
+no more 125 KB never-freed pool, no more duplicate-fixed-buffer hazards (the 2.EC
+IDLE0-overwrite class), and free() works — prerequisites for ANY-sketch support.
+
+## Still standing between here and true ANY-sketch support
+
+- The remaining runtime patches at APP addresses (0x40003xxx loopTask affinity,
+  0x40009xxx start_cpu0 tweaks, flash-clock guard @0x40009498, partition stub
+  @0x4000549C...) are BINARY-SPECIFIC to blink.ino — a different sketch places
+  those functions elsewhere (the blink_noserial early-abort proved this). Next
+  frontier: make them symbolic (resolve from the loaded ELF's symtab at machine
+  init) or model the underlying hardware so the guards pass naturally.
+- esp_timer_get_time still stubbed to return 0 (2.DX) — un-skip next now that
+  do_system_init runs esp_timer_impl_init (affects micros()/timing APIs).
+- 4 residual silenced configASSERTs still fire during boot ([assertcaller]) —
+  the planned assert-LOGGING stub will name them.
