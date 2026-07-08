@@ -1907,3 +1907,61 @@ WFI↔loop()↔delay(). **setup()/loop() ejecutan en CORE 1 como en hardware rea
   para que lea 80/80 en vez de neutralizar el branch.
 - esp_ota_get_running_partition stub @0x4000549C — la tabla de particiones real ya
   carga (fix "No MD5" 2.EC) → un-skip y dejar esp_partition_find real.
+
+---
+
+# Phase 2.EN (en curso) — retirar los 5 stop-gaps de app-address
+
+## Grounding del flash layout (blink.ino.merged.bin, 4 MB) — confirmado con dump_flash_layout.sh
+
+| offset flash | contenido | magic |
+|---|---|---|
+| 0x02000 | 2nd-stage bootloader image | E9 03 |
+| 0x08000 | partition table (6 entries válidas) | AA 50 |
+| 0x10000 | app0 (la que corre) | E9 06 |
+Particiones: nvs@0x9000, otadata@0xe000, **app0@0x10000 (0x140000)**, app1@0x150000,
+spiffs@0x290000, coredump@0x3f0000. Todo REAL y presente → la tabla de particiones y los
+headers de imagen existen; el stub de esp_ota_get_running (2.T) y el magic-check bypass
+(2.J) probablemente ya son innecesarios (a confirmar con el mapeo MMU de la ventana cache
+0x40000000 → offset de flash).
+
+Los 5 stop-gaps de app-address a resolver (workflow wf_cd46df62 investigándolos):
+- 0x40007F64 + 0x40008096: CPU1-wait en system_early_init (2.J, pre-core-1).
+- 0x40008064: magic check 0xE9 @0x40030000 (2.J).
+- 0x4000549C: esp_ota_get_running_partition → fake struct (2.T-fix).
+- 0x40009498: flash-clock-divider guard (a6=src=80 fijo; a5=target — investigar unidad/fuente).
+
+## Phase 2.EN — resultado (workflow wf_cd46df62, 5 agentes: IDF+TRM+S3)
+
+3 de los 5 stop-gaps de app-address RETIRADOS bajo REAL_INIT (todos gated, demo
+byte-idéntica; verificados con blink continuo + serial + sin aborts):
+
+- **Step 1 — CPU1-wait (0x40007F64 + 0x40008096)**: UN-SKIP puro. Eran barreras de
+  rendezvous de system_early_init (s_cpu_up / s_cpu_inited) de la era pre-core-1.
+  Ahora core 1 se instancia y corre el call_start_cpu1 REAL que setea esas flags él
+  mismo → el handshake dual-core converge, como en silicio. (Log: "HP core 1 RELEASED
+  from reset → PC=0x4fc00000".)
+- **Step 2 — flash-clock guard (0x40009498)**: MODELADO EL HARDWARE (preferido).
+  El guard `bge src,target` fallaba porque `spimem_flash_ll_get_source_freq_mhz` lee
+  HP_SYS_CLKRST_PERI_CLK_CTRL00 (0x500E6030) que devolvía 0. Añadida fila smart-override
+  = 0x5D (FLASH_CLK_SRC_SEL=SPLL480, DIV=5 → 480/6 = 80 MHz = flash_freq del board), por
+  TRM "HP-SYS Clock and Reset" / hp_sys_clkrst_reg.h. Byte-patch eliminado; el guard
+  pasa naturalmente (80>=80).
+- **Step 3 — magic check 0xE9 (0x40008064)**: MODELADA la DROM cache-page. La app REAL
+  tiene el header esp_image_header_t (E9) en flash 0x10000 (app0). Al cargar el -kernel,
+  sembramos guest 0x40030000 (= _flash_rodata_start & ~0xFFFF, que load_elf dejaba como
+  NOBITS/0xF5) con 32 bytes de flash_blob[0x10000]. El check `lbu 0x40030000 == 0xE9`
+  pasa con el header REAL. (Log: "DROM page 0x40030000 seeded ... magic=0xe9".)
+
+- **Step 4 — esp_ota_get_running_partition stub (0x4000549C)**: MANTENIDO (2.EO). El
+  agente probó estáticamente que un-skipear aborta: spi_flash_cache2phys(0x4000549c)
+  devuelve fuera de toda partición porque el Cache-MMU aún no mapea la ventana
+  0x40000000 a páginas de flash de app-partition (usa copia identidad). Fix futuro:
+  modelar el MSPI Cache-MMU (base 0x5008C000, idx +0x380, content +0x37C, páginas 64KB,
+  entry = phys_page|VALID) sirviendo desde flash 0x10000+, luego un-skipear. Inofensivo
+  en el happy-path (el resultado solo alimenta esp_ota_get_state_partition).
+
+Estado: el boot real ya NO tiene parches de app-address salvo el partition-stub (2.EO) y
+la afinidad/scheduler que ya son ORIGINALES bajo REAL_INIT. Umbral any-sketch mucho más
+cerca: quedan por hacer symbolic-patch-resolution (para direcciones que sí dependen del
+binario) + el Cache-MMU de particiones.
