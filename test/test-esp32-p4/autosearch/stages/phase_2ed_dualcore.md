@@ -1965,3 +1965,77 @@ Estado: el boot real ya NO tiene parches de app-address salvo el partition-stub 
 la afinidad/scheduler que ya son ORIGINALES bajo REAL_INIT. Umbral any-sketch mucho más
 cerca: quedan por hacer symbolic-patch-resolution (para direcciones que sí dependen del
 binario) + el Cache-MMU de particiones.
+
+## Phase 2.EO — MSPI Cache-MMU de particiones MODELADO (cache2phys funciona); el un-skip revela el bloqueador `memspi: no response`
+
+**Objetivo**: retirar el último stop-gap de app-address bajo REAL_INIT — el
+partition-stub `esp_ota_get_running_partition` (0x4000549C) heredado de 2.T-fix —
+modelando el MSPI Cache-MMU real para que `spi_flash_cache2phys` haga el
+reverse-map genuino, como en silicio.
+
+### Lo que se INVESTIGÓ (workflow wf_3993cb86, agentes IDF+TRM+S3)
+- **`spi_flash_cache2phys(vaddr)`** (IDF `spi_flash_mmap.c`): NO usa una lista
+  software; lee los registros HW del Cache-MMU y busca la entry cuyo VALID esté
+  puesto y cuyo `entry_id` corresponda a `(vaddr & 0x3FFFFFF) >> 16`, devolviendo
+  `(entry.phys_page << 16) | (vaddr & 0xFFFF)`. Base MMU 0x5008C000, registro de
+  índice +0x380, registro de contenido +0x37C, páginas de 64 KB, bit VALID = 0x1000
+  (bit12), máscara de página = 0x0FFF, 1024 entries. Ventana virtual base 0x40000000
+  (TRM Cap. 7 "External Memory / Cache" + `cache_ll.h`).
+- **La app REAL** (blink app0) tiene sus segmentos ejecutables mapeados por el
+  bootloader desde flash 0x10000+ (esp_image_header + segment headers: cada segment
+  con `load_addr` en [0x40000000,0x44000000) es código en la ventana de instrucción-cache).
+  0x4000549c cae en el primer segment → su página física es flash 0x30000..0x3FFFF
+  → `cache2phys(0x4000549c) = 0x3549c`, que SÍ está dentro de app0 [0x10000,0x150000).
+
+### Lo que FUNCIONÓ — Edits 1+2 (el modelo Cache-MMU), VERIFICADO, se MANTIENE
+- **Edit 1** (`esp32p4_mspi_flash_read`, REAL_INIT-gated): el read del registro de
+  contenido +0x37C devuelve `g_esp32p4_mmu->entries[pending_idx]` — read-back real
+  de la tabla MMU, en vez del smart-stub genérico.
+- **Edit 2** (tras el DROM-seed): al arrancar, se parsean los segment headers de la
+  imagen app0 (`flash_blob[0x10000]`, magic 0xE9) y para cada segment con `load_addr`
+  en la ventana de instrucción se pre-programa
+  `entries[((load_addr&0x3FFFFFF)>>16)+i] = (phys_page) | VALID`.
+- **Verificación** (sonda de diagnóstico one-shot en el bloque REAL-INIT parttable):
+  `cache2phys diag: va=0x4000549c entry_id=0 entries[0]=0x00001003 VALID=1 ->
+  paddr=0x0003549c` ✓ — el reverse-map da EXACTAMENTE la dirección de flash esperada
+  dentro de app0. Sin regresión: con el stub aún activo + Edits 1+2, el blink sigue
+  continuo (43/42) y el serial imprime "ESP32-P4 blink starting".
+
+### Lo que NO FUNCIONÓ — Edit 3 (un-skipear el stub) → bloqueador `memspi: no response`
+Al retirar el skip de 0x4000549C (dejar correr el `esp_ota_get_running_partition`
+REAL), el boot se para: 0 blink, core 0 en WFI, sin aborts. El trace del path
+(44 funciones) llega a `esp_ota_get_state_partition → read_otadata →
+esp_partition_read → esp_flash_read`, y una corrida de 60 s revela en consola:
+
+```
+E (1473) memspi: no response
+E (1680) esp_core_dump_flash: Failed to read core dump data size (24579)!
+```
+
+**Causa raíz**: `cache2phys` (la ventana cache, RAM-backed) SÍ está modelada, pero
+`esp_flash_read` NO usa la cache — emite **comandos SPI-flash CRUDOS** por el
+controlador MSPI (`spimem_flash_ll` / memspi), y nuestro emulador no tiene un
+dispositivo SPI-flash que responda a esos comandos de lectura (la flash es un blob
+en RAM servido SOLO por la ventana cache-MMU, no por el interfaz de comando SPI).
+El memspi hace timeout → "no response". Modelar `esp_flash_read` (el path de
+comando de `spimem_flash_ll` sirviendo desde `flash_blob`) es **Phase 2.EP**.
+
+### Decisión
+- **Edits 1+2 (modelo Cache-MMU) → MANTENIDOS**: mejora de fidelidad real y
+  verificada (cache2phys funciona como en silicio), sin regresión, gated REAL_INIT.
+- **Edit 3 (un-skip) → REVERTIDO**: el stub `esp_ota_get_running_partition` se
+  mantiene, ahora DOCUMENTADO como inofensivo en el happy-path (su resultado solo
+  alimenta `esp_ota_get_state_partition`, que devuelve no-cero y salta el bloque de
+  OTA-verify). Retirarlo requiere el modelo de lectura SPI-flash cruda (2.EP).
+
+### Estado verificado (con Edits 1+2 + stub)
+- real-init blink continuo: **43 HIGH / 42 LOW**, sin abort/panic ✓
+- real-init serial: **"ESP32-P4 blink starting"** ✓
+- demo path (sin REAL_SCHED): sin crash, todos los periféricos vivos
+  (timg1/timg0/gpio/ledc/intmtx0/adc/efuse) — byte-idéntico ✓
+
+### Próximo (2.EP)
+Modelar el path de lectura SPI-flash cruda del controlador MSPI
+(`spimem_flash_ll` command/response desde `flash_blob`) para que `esp_flash_read`
+/ `esp_partition_read` devuelvan datos reales → entonces un-skipear el
+partition-stub y dejar correr el `esp_ota_get_running_partition` genuino.
