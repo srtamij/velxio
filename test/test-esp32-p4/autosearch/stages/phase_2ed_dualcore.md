@@ -1847,3 +1847,63 @@ IDLE0-overwrite class), and free() works — prerequisites for ANY-sketch suppor
   do_system_init runs esp_timer_impl_init (affects micros()/timing APIs).
 - 4 residual silenced configASSERTs still fire during boot ([assertcaller]) —
   the planned assert-LOGGING stub will name them.
+
+---
+
+# Phase 2.EL + 2.EM — 🎉 esp_timer/stackovf REALES + tick de CORE 1 + loopTask en CORE 1
+
+## 2.EL (verificado): dos stop-gaps 2.DX retirados bajo REAL_INIT
+
+- `esp_timer_get_time` ORIGINAL (el stub devolvía 0 → micros()/APIs de tiempo rotas).
+  Con do_system_init real, esp_timer_impl_init fija el fn-ptr (0x4FF13B40) y el
+  tail-call original funciona.
+- `vApplicationStackOverflowHook` ORIGINAL (el noop tapaba un falso positivo de la
+  era bump; con stacks del heap real + canary correcto, el hook real — que aborta
+  en overflow GENUINO — es comportamiento de silicio).
+- Verificación: 4/4 runs wall-clock verdes + icount verde.
+- ANOMALÍA OBSERVADA UNA VEZ (documentada, a vigilar): un run aislado abortó con
+  "FreeRTOS Task 'main' should not return" — main_task retornó en vez de
+  auto-borrarse (¿vTaskDelete(NULL) retornando si el yield no conmuta?). No
+  reproducido en 7+ runs posteriores.
+
+## 2.EM (verificado): tick propio de core 1 + loopTask en core 1
+
+**Lo que se hizo (TRM Cap 15 + patrón de silicio):**
+1. Dispositivo SYSTIMER: segunda salida IRQ `irq_target1` = comparador TARGET1
+   (fuente de interrupción 54 = ETS_SYSTIMER_TARGET1, el OS-tick de core 1 en el
+   convenio IDF ALARM_OS_TICK_CORE1=1). Mismo tick de 1 ms; latch int_raw bit1;
+   gating por INT_ENA bit1; ack por INT_CLR bit1.
+2. Máquina: router `esp32p4_systimer_irq_route1` → matriz de interrupciones DE
+   CORE 1 (MAP[54], programada por el esp_intr_alloc que corre EN core 1) →
+   línea CLIC de core 1. Silencioso en demo/single-core.
+3. Un-skip de la afinidad 2.DY: app_main ORIGINAL crea loopTask anclada a CORE 1
+   (ARDUINO_RUNNING_CORE), exactamente como el Arduino-ESP32 físico.
+
+**Primer intento FALLÓ (documentado):** core 1 despachaba loopTask pero se
+atascaba batiendo en xPortEnterCriticalTimeout/vPortExitCritical (0 toggles).
+Causa: el gap ya señalado por el workflow de 2.EF — el backing-store del CLIC es
+COMPARTIDO entre cores, y `rv_utils_set_intlevel_regval` hace save(READ)/restore
+(WRITE) del threshold alrededor de cada sección crítica. Con AMBOS cores
+planificando a la vez, cada core leía el threshold guardado por el OTRO y
+restauraba el nivel equivocado → threshold pegado alto → ticks diferidos para
+siempre.
+
+**Fix (per-core, como el silicio — cada HP core tiene SU CLIC):** la lectura de
+CLIC_INT_THRESH_REG (offset 0x8) devuelve el `clic_thresh` modelado DEL CORE QUE
+LEE (`current_cpu`), no el storage compartido (el write ya era per-core desde
+2.ED).
+
+**Resultado (3/3 wall-clock):** serial 24/24, GPIO 24 ciclos, 0 aborts, con el
+histograma de IRQs probando la fidelidad: hart=0 recibe SU tick (cause=18, 99×) y
+hart=1 recibe SU tick (cause=17 vía SU matriz, 94×). Core 1 alterna
+WFI↔loop()↔delay(). **setup()/loop() ejecutan en CORE 1 como en hardware real.**
+
+## Pendiente inmediato (2.EN): quedan 4 stop-gaps de app-address bajo el boot real
+- system_early_init: skip del wait de CPU1 (0x40008096) + beqz→nop (0x40007F64) —
+  probar un-skip: el handshake real startup_resume_other_cores debería funcionar ya.
+- magic check 0xE9 @0x40030000 (0x40008064) — verificar que la ventana flash-cache
+  sirve el header real y un-skipear.
+- flash-clock guard @0x40009498 — MODELAR el clock-config (HP_SYS_CLKRST por TRM)
+  para que lea 80/80 en vez de neutralizar el branch.
+- esp_ota_get_running_partition stub @0x4000549C — la tabla de particiones real ya
+  carga (fix "No MD5" 2.EC) → un-skip y dejar esp_partition_find real.
