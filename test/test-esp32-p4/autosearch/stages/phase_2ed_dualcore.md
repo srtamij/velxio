@@ -2039,3 +2039,81 @@ Modelar el path de lectura SPI-flash cruda del controlador MSPI
 (`spimem_flash_ll` command/response desde `flash_blob`) para que `esp_flash_read`
 / `esp_partition_read` devuelvan datos reales → entonces un-skipear el
 partition-stub y dejar correr el `esp_ota_get_running_partition` genuino.
+
+## Phase 2.EP — MODELADO el path de comando SPI-flash crudo (SPI1/memspi): "memspi: no response" RESUELTO; el un-skip revela el bloqueador flash-op cross-core (2.EQ)
+
+**Objetivo**: modelar el controlador SPI1 (memspi) que `esp_flash_read` /
+`esp_partition_read` / el auto-detect del chip usan con comandos MANUALES, para
+resolver el `E memspi: no response` (bloqueador de 2.EO) y retirar el
+partition-stub.
+
+### Investigación (workflow wf_3f435870-ac5, 4 investigadores IDF+TRM+S3 + síntesis)
+- **Causa raíz del "no response"** (corrección al framing de 2.EO): NO viene de
+  `esp_flash_read` sino del **RDID (0x9F)** del auto-detect del chip.
+  `memspi_host_read_id_hs()` (memspi_host_driver.c:91-106) emite RDID y si
+  `raw_flash_id == 0 || 0xFFFFFF` → `ESP_EARLY_LOGE("memspi", "no response")`.
+  El SPI1 estaba SIN mapear (caía al catch-all pri-0 = 0) → RDID leía 0.
+- **SPI1 = DR_REG_FLASH_SPI1_BASE = 0x5008D000** (reg_base.h:53 = HPPERIPH0 +
+  0x8D000), distinto de SPI0/cache @0x5008C000. Registros (spi1_mem_c_reg.h,
+  verificados): CMD@0x0 (USR=bit18=0x40000, cmd_is_done ⟺ CMD==0), ADDR@0x4
+  (raw en P4, sin bswap), USER2@0x20 (opcode = val&0xFF), MISO_DLEN@0x28
+  (bits[9:0], nbytes=(val+1)/8), W0@0x58..W15@0x94 (16 words, LE).
+  Secuencia memspi: set USER2 cmd; set ADDR; set MISO_DLEN; set CMD.USR (start);
+  spin CMD==0; memcpy(buf, &data_buf(W0..), len). Ref S3: hw/ssi/esp32s3_spi.c.
+
+### Lo que FUNCIONÓ — el modelo SPI1 (verificado, se MANTIENE)
+Nuevo device `esp32p4_install_spi1_flashop` @0x5008D000 (REAL_INIT-gated,
+mirror de install_mspi_flash; demo byte-idéntica porque sin REAL_INIT el base
+sigue cayendo al catch-all). El write handler, en el trigger CMD.USR, decodifica
+opcode+addr+len desde el scratch que el guest ya escribió y llena W0..W15:
+- **RDID (0x9F)** → W0 = 0x001640EF (bytes EF 40 16) → `*id = 0xEF4016` =
+  Winbond W25Q32 (capacity 0x16 = 2^22 = 4 MB ≥ imagen). Cálculo verificado
+  contra memspi_host_driver.c:108-110.
+- **READ (0x03/0x0B/0x3B/0x6B/0xBB/0xEB)** → memcpy `flash_blob[ADDR & (size-1)]`
+  → W0.. (LE), con bounds-check. Backing = el mismo `g_esp32p4_mmu->flash_blob`
+  (imagen -drive mtd).
+- **RDSR (0x05/0x35/0x15)** → 0 (WIP=0 no-busy, sin protección).
+- CMD read handler → siempre 0 (cmd_is_done instantáneo, transferencia síncrona).
+**Traza [spi1] verificada**: `op=0x9f W0=001640ef` (×2, detect+verify),
+`op=0x35/0x05 → 0`, `op=0x01` (WRSR, ignorado). **"memspi: no response"
+DESAPARECIÓ.** Blink 37/37, serial OK, demo byte-idéntica.
+
+### Lo que NO FUNCIONÓ — el un-skip del partition-stub → bloqueador flash-op cross-core
+Al retirar el skip de 0x4000549C + fake struct (0x4FFA0030..58), el boot se para
+ANTES de setup() (0 blink, 0 serial). Diagnóstico (count_reboot.sh, traza in_asm):
+el path REAL SÍ se alcanza — `esp_ota_get_running_partition`(×10) →
+`read_otadata`(×7) → `esp_partition_read`(×5) → `esp_flash_read`(×3) →
+`spi_flash_op_block_func`(×4) → **`spi_flash_disable_interrupts_caches_and_other_cpu`**(×17).
+PERO `spi_flash_hal_read` = **0** (el comando READ nunca se emite; el modelo SPI1
+es correcto y simplemente no se alcanza). Las últimas funciones ejecutadas:
+`ipc_task / spi_flash_op_block_func / xTaskIncrementTickOtherCores /
+_interrupt_handler`. → Se cuelga en el **handshake flash-op cross-core**:
+`spi_flash_disable_interrupts_caches_and_other_cpu` hace IPC a core 1 (ipc_task)
+para pararlo y busy-waitea el ack durante la op de flash; ese handshake NO
+converge bajo nuestro round-robin TCG (el bloqueador documentado en 2.ED). Es una
+capa MÁS PROFUNDA que 2.EO (que era "no hay modelo SPI1").
+
+Nota: el coredump-check (esp_partition_read @0x3f0000) NO cuelga en el happy-path
+porque corre antes de que ipc_task esté activo (path single-core); el
+`esp_ota_get_running_partition` corre en initArduino con ambos cores + ipc_task
+vivos, por eso intenta el cross-core stall y se cuelga.
+
+### Decisión
+- **Modelo SPI1 → MANTENIDO**: mejora de fidelidad verificada (RDID real, chip
+  detectado, "no response" resuelto), sin regresión con el stub, gated REAL_INIT.
+- **Un-skip → REVERTIDO**: el stub `esp_ota_get_running_partition` se mantiene,
+  documentado como inofensivo en el happy-path. Retirarlo requiere modelar/bypasear
+  el IPC flash-op cross-core (`spi_flash_op_block_func` /
+  `spi_flash_disable_interrupts_caches_and_other_cpu`) → **Phase 2.EQ**.
+
+### Estado verificado (SPI1 model + stub)
+- real-init blink continuo: **37 HIGH / 37 LOW**, sin abort ✓
+- real-init serial: **"ESP32-P4 blink starting"**, sin "memspi: no response" ✓
+- demo (sin REAL_SCHED): sin crash, periféricos vivos, byte-idéntico ✓
+
+### Próximo (2.EQ)
+Modelar/bypasear el handshake flash-op cross-core para que
+`spi_flash_op_block_func` complete bajo round-robin TCG (el mismo bloqueador
+2.ED que ya se neutraliza parcialmente con el c.nop @0x4ff0091e). Entonces el
+`esp_ota_get_running_partition` REAL correrá contra el modelo SPI1 y se podrá
+retirar el último stop-gap de app-address.
